@@ -66,7 +66,7 @@ public class NamesDatabaseIntegrityCheck {
                 if (currentTransaction.getType() == TransactionType.UPDATE_NAME) {
                     UpdateNameTransactionData updateNameTransactionData = (UpdateNameTransactionData) currentTransaction;
                     Name nameObj = new Name(repository, updateNameTransactionData.getName());
-                    if (nameObj != null && nameObj.getNameData() != null) {
+                    if (nameObj.getNameData() != null) {
                         nameObj.update(updateNameTransactionData);
                         modificationCount++;
                         LOGGER.trace("Processed UPDATE_NAME transaction for name {}", name);
@@ -80,7 +80,7 @@ public class NamesDatabaseIntegrityCheck {
                 if (currentTransaction.getType() == TransactionType.SELL_NAME) {
                     SellNameTransactionData sellNameTransactionData = (SellNameTransactionData) currentTransaction;
                     Name nameObj = new Name(repository, sellNameTransactionData.getName());
-                    if (nameObj != null && nameObj.getNameData() != null) {
+                    if (nameObj.getNameData() != null) {
                         nameObj.sell(sellNameTransactionData);
                         modificationCount++;
                         LOGGER.trace("Processed SELL_NAME transaction for name {}", name);
@@ -95,7 +95,7 @@ public class NamesDatabaseIntegrityCheck {
                 if (currentTransaction.getType() == TransactionType.CANCEL_SELL_NAME) {
                     CancelSellNameTransactionData cancelSellNameTransactionData = (CancelSellNameTransactionData) currentTransaction;
                     Name nameObj = new Name(repository, cancelSellNameTransactionData.getName());
-                    if (nameObj != null && nameObj.getNameData() != null) {
+                    if (nameObj.getNameData() != null) {
                         nameObj.cancelSell(cancelSellNameTransactionData);
                         modificationCount++;
                         LOGGER.trace("Processed CANCEL_SELL_NAME transaction for name {}", name);
@@ -110,7 +110,7 @@ public class NamesDatabaseIntegrityCheck {
                 if (currentTransaction.getType() == TransactionType.BUY_NAME) {
                     BuyNameTransactionData buyNameTransactionData = (BuyNameTransactionData) currentTransaction;
                     Name nameObj = new Name(repository, buyNameTransactionData.getName());
-                    if (nameObj != null && nameObj.getNameData() != null) {
+                    if (nameObj.getNameData() != null) {
                         nameObj.buy(buyNameTransactionData, false);
                         modificationCount++;
                         LOGGER.trace("Processed BUY_NAME transaction for name {}", name);
@@ -367,7 +367,7 @@ public class NamesDatabaseIntegrityCheck {
                 RegisterNameTransactionData registerNameTransactionData = (RegisterNameTransactionData) transactionData;
                 involvedNames.add(registerNameTransactionData.getName());
                 String reducedName = Unicode.sanitize(registerNameTransactionData.getName());
-                if (reducedName != null && !reducedName.equals(registerNameTransactionData.getName())) {
+                if (!reducedName.equals(registerNameTransactionData.getName())) {
                     involvedNames.add(reducedName);
                 }
             }
@@ -377,7 +377,7 @@ public class NamesDatabaseIntegrityCheck {
                 if (updateNameTransactionData.getNewName() != null) {
                     involvedNames.add(updateNameTransactionData.getNewName());
                     String reducedNewName = Unicode.sanitize(updateNameTransactionData.getNewName());
-                    if (reducedNewName != null && !reducedNewName.isEmpty()) {
+                    if (!reducedNewName.isEmpty()) {
                         involvedNames.add(reducedNewName);
                     }
                 }
@@ -425,29 +425,37 @@ public class NamesDatabaseIntegrityCheck {
         }
 
         // Fall back to database queries if cache not available
+        // Use ORDER BY to get pre-sorted results from database, leveraging composite indexes
         List<byte[]> signatures = new ArrayList<>();
         String reducedName = Unicode.sanitize(name);
+        String orderBy = "block_height, created_when, signature";
 
-        List<byte[]> registerNameTransactions = repository.getTransactionRepository().getSignaturesMatchingCustomCriteria(
-                TransactionType.REGISTER_NAME, Arrays.asList("(name = ? OR reduced_name = ?)"), Arrays.asList(name, reducedName));
+        List<byte[]> registerNameTransactions = ((org.qortal.repository.hsqldb.transaction.HSQLDBTransactionRepository)
+                repository.getTransactionRepository()).getSignaturesMatchingCustomCriteria(
+                TransactionType.REGISTER_NAME, Arrays.asList("(name = ? OR reduced_name = ?)"),
+                Arrays.asList(name, reducedName), null, orderBy);
         signatures.addAll(registerNameTransactions);
 
-        List<byte[]> updateNameTransactions = repository.getTransactionRepository().getSignaturesMatchingCustomCriteria(
+        List<byte[]> updateNameTransactions = ((org.qortal.repository.hsqldb.transaction.HSQLDBTransactionRepository)
+                repository.getTransactionRepository()).getSignaturesMatchingCustomCriteria(
                 TransactionType.UPDATE_NAME,
                 Arrays.asList("(name = ? OR new_name = ? OR (reduced_new_name != '' AND reduced_new_name = ?))"),
-                Arrays.asList(name, name, reducedName));
+                Arrays.asList(name, name, reducedName), null, orderBy);
         signatures.addAll(updateNameTransactions);
 
-        List<byte[]> sellNameTransactions = repository.getTransactionRepository().getSignaturesMatchingCustomCriteria(
-                TransactionType.SELL_NAME, Arrays.asList("name = ?"), Arrays.asList(name));
+        List<byte[]> sellNameTransactions = ((org.qortal.repository.hsqldb.transaction.HSQLDBTransactionRepository)
+                repository.getTransactionRepository()).getSignaturesMatchingCustomCriteria(
+                TransactionType.SELL_NAME, Arrays.asList("name = ?"), Arrays.asList(name), null, orderBy);
         signatures.addAll(sellNameTransactions);
 
-        List<byte[]> buyNameTransactions = repository.getTransactionRepository().getSignaturesMatchingCustomCriteria(
-                TransactionType.BUY_NAME, Arrays.asList("name = ?"), Arrays.asList(name));
+        List<byte[]> buyNameTransactions = ((org.qortal.repository.hsqldb.transaction.HSQLDBTransactionRepository)
+                repository.getTransactionRepository()).getSignaturesMatchingCustomCriteria(
+                TransactionType.BUY_NAME, Arrays.asList("name = ?"), Arrays.asList(name), null, orderBy);
         signatures.addAll(buyNameTransactions);
 
-        List<byte[]> cancelSellNameTransactions = repository.getTransactionRepository().getSignaturesMatchingCustomCriteria(
-                TransactionType.CANCEL_SELL_NAME, Arrays.asList("name = ?"), Arrays.asList(name));
+        List<byte[]> cancelSellNameTransactions = ((org.qortal.repository.hsqldb.transaction.HSQLDBTransactionRepository)
+                repository.getTransactionRepository()).getSignaturesMatchingCustomCriteria(
+                TransactionType.CANCEL_SELL_NAME, Arrays.asList("name = ?"), Arrays.asList(name), null, orderBy);
         signatures.addAll(cancelSellNameTransactions);
 
         List<TransactionData> transactions = new ArrayList<>();
@@ -460,6 +468,8 @@ public class NamesDatabaseIntegrityCheck {
         }
 
         // Sort by lowest block height first
+        // Note: Each individual query already returns pre-sorted results thanks to composite indexes,
+        // so this sort operates on mostly-sorted data and is very fast (O(n) with TimSort)
         sortTransactions(transactions);
 
         return transactions;
@@ -469,12 +479,10 @@ public class NamesDatabaseIntegrityCheck {
         List<TransactionData> transactionsInvolvingName = this.fetchAllTransactionsInvolvingName(registeredName, repository);
 
         // Get the latest update for this name (excluding REGISTER_NAME transactions)
-        TransactionData latestUpdateToName = transactionsInvolvingName.stream()
+        return transactionsInvolvingName.stream()
                 .filter(txn -> txn.getType() != TransactionType.REGISTER_NAME)
                 .max(Comparator.comparing(TransactionData::getTimestamp))
                 .orElse(null);
-
-        return latestUpdateToName;
     }
 
     private List<String> fetchAllNames(Repository repository) throws DataException {

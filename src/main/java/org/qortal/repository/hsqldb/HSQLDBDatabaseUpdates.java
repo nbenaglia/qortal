@@ -958,6 +958,7 @@ public class HSQLDBDatabaseUpdates {
 					stmt.execute("CREATE INDEX BuyNameNameIndex ON BuyNameTransactions (name)");
 					// For looking up sell name transactions based on name
 					stmt.execute("CREATE INDEX SellNameNameIndex ON SellNameTransactions (name)");
+					stmt.execute("CREATE INDEX CancelSellNameNameIndex ON CancelSellNameTransactions (name)");
 					break;
 
 				case 41:
@@ -1059,9 +1060,25 @@ public class HSQLDBDatabaseUpdates {
 							+ "PRIMARY KEY (owner), FOREIGN KEY (name) REFERENCES Names (name) ON DELETE CASCADE)");
 					break;
 
-				default:
-					// nothing to do
-					return false;
+
+				case 51:
+					// Add covering index for account balances query optimization
+					// This index allows the query "SELECT account, balance FROM AccountBalances WHERE asset_id = 0"
+					// to be satisfied entirely from the index without accessing the table
+					stmt.execute("CREATE INDEX AccountBalancesAssetAccountBalanceIndex ON AccountBalances (asset_id, account, balance)");
+					break;
+
+			case 52:
+				// Add index on block_sequence to optimize needsTransactionSequenceRebuild() check
+				// The existing composite index (block_height, block_sequence) doesn't efficiently handle
+				// queries like "WHERE block_height IS NOT NULL AND block_sequence IS NULL"
+				LOGGER.info("Adding index on Transactions.block_sequence - this can take a while...");
+				stmt.execute("CREATE INDEX TransactionBlockSequenceIndex ON Transactions (block_sequence)");
+				break;
+
+			default:
+				// nothing to do
+				return false;
 			}
 		}
 
