@@ -1069,6 +1069,27 @@ public class HSQLDBDatabaseUpdates {
 
 					break;
 
+				case 52:
+					// Performance optimization indexes for signature gathering query
+					LOGGER.info("Adding performance indexes for arbitrary transaction queries...");
+
+					// Composite index to optimize the signature gathering query
+					// This covers the WHERE clause (name IS NOT NULL, update_method = 0) and helps with JOIN
+					stmt.execute("CREATE INDEX IF NOT EXISTS ArbitraryTransactionsOptimizedLookupIndex " +
+							"ON ArbitraryTransactions (name, update_method, service, identifier)");
+
+					// Composite index on Transactions to optimize JOIN and ORDER BY in the signature gathering query
+					// The signature is used for JOIN, created_when for ORDER BY in the window function
+					stmt.execute("CREATE INDEX IF NOT EXISTS TransactionsSignatureCreatedIndex " +
+							"ON Transactions (signature, created_when DESC)");
+
+					// Composite index for resource cache lookups
+					stmt.execute("CREATE INDEX IF NOT EXISTS ArbitraryResourcesCacheLookupIndex " +
+							"ON ArbitraryResourcesCache (name, service, identifier)");
+
+					LOGGER.info("Performance indexes created successfully");
+					break;
+
 				default:
 					// nothing to do
 					return false;

@@ -101,20 +101,33 @@ public class ArbitraryDataCacheManager extends Thread {
                 LOGGER.info("Gathering latest signatures for QDN ...");
 
                 try (Statement arbitraryTransactionSelectionStatement = connection.createStatement()) {
+                    // Use window function to get only the latest signature for each (service, name, identifier) combination
+                    // This is much more efficient than fetching all rows and deduplicating in Java
                     ResultSet resultSet = arbitraryTransactionSelectionStatement.executeQuery(
                             "SELECT signature, service, name, identifier " +
-                                    "FROM Transactions t " +
-                                    "JOIN ArbitraryTransactions a ON t.signature = a.signature " +
-                                    "WHERE name IS NOT NULL AND a.update_method = 0 " +
-                                    "ORDER BY created_when DESC "
+                                    "FROM ( " +
+                                    "  SELECT " +
+                                    "    a.signature, " +
+                                    "    a.service, " +
+                                    "    a.name, " +
+                                    "    a.identifier, " +
+                                    "    ROW_NUMBER() OVER ( " +
+                                    "      PARTITION BY a.service, a.name, COALESCE(a.identifier, 'default') " +
+                                    "      ORDER BY t.created_when DESC " +
+                                    "    ) as rn " +
+                                    "  FROM ArbitraryTransactions a " +
+                                    "  JOIN Transactions t ON a.signature = t.signature " +
+                                    "  WHERE a.name IS NOT NULL AND a.update_method = 0 " +
+                                    ") ranked " +
+                                    "WHERE rn = 1"
                     );
 
                     Map<ArbitraryTransactionDataHashWrapper, byte[]> signatureByData = new HashMap<>();
 
-                    // process arbitrary transaction results
+                    // process arbitrary transaction results (now only contains latest signatures)
                     while (resultSet.next()) {
 
-                        signatureByData.putIfAbsent(
+                        signatureByData.put(
                                 new ArbitraryTransactionDataHashWrapper(
                                         resultSet.getInt(2),
                                         resultSet.getString(3),
