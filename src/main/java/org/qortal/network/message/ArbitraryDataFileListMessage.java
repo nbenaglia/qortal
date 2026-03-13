@@ -3,6 +3,7 @@ package org.qortal.network.message;
 import com.google.common.primitives.Ints;
 import com.google.common.primitives.Longs;
 import org.qortal.data.network.PeerData;
+import org.qortal.network.NetworkData;
 import org.qortal.transform.TransformationException;
 import org.qortal.transform.Transformer;
 import org.qortal.utils.Serialization;
@@ -20,6 +21,7 @@ public class ArbitraryDataFileListMessage extends Message {
 	private Long requestTime;
 	private Integer requestHops;
 	private String peerAddress;
+	private String nodeId;  // used for the cache map, IMPORTANT for multiple nodes behind a single IP
 	private Boolean isRelayPossible;
     private Boolean isDirectConnectable;
 
@@ -35,13 +37,13 @@ public class ArbitraryDataFileListMessage extends Message {
 
     /** Pre v6.0.0 version **/
     public ArbitraryDataFileListMessage(byte[] signature, List<byte[]> hashes, Long requestTime,
-                                        Integer requestHops, String peerAddress, Boolean isRelayPossible) {
-        this(signature, hashes,  requestTime, requestHops,  peerAddress,  isRelayPossible, false);
+                                        Integer requestHops, String peerAddress, String nodeId, Boolean isRelayPossible) {
+        this(signature, hashes,  requestTime, requestHops,  peerAddress, nodeId, isRelayPossible, false);
     }
 
     // Add in Split Network to denote ability to accept direct connect
 	public ArbitraryDataFileListMessage(byte[] signature, List<byte[]> hashes, Long requestTime,
-										Integer requestHops, String peerAddress, Boolean isRelayPossible, Boolean isDirectConnectable) {
+										Integer requestHops, String peerAddress, String nodeId, Boolean isRelayPossible, Boolean isDirectConnectable) {
 		super(MessageType.ARBITRARY_DATA_FILE_LIST);
 
 		ByteArrayOutputStream bytes = new ByteArrayOutputStream();
@@ -60,6 +62,7 @@ public class ArbitraryDataFileListMessage extends Message {
             bytes.write(Ints.toByteArray(requestHops));
 
             Serialization.serializeSizedStringV2(bytes, peerAddress);
+			Serialization.serializeSizedStringV2(bytes, nodeId);
             /* Integer mapping for possible values in the connectivity field
              * 0 = no relay is available
              * 1 = relay is available
@@ -79,7 +82,7 @@ public class ArbitraryDataFileListMessage extends Message {
 	}
 
 	private ArbitraryDataFileListMessage(int id, byte[] signature, List<byte[]> hashes, Long requestTime,
-										Integer requestHops, String peerAddress, boolean isRelayPossible, boolean isDirectConnectable) {
+										Integer requestHops, String peerAddress, String nodeId, boolean isRelayPossible, boolean isDirectConnectable) {
 		super(id, MessageType.ARBITRARY_DATA_FILE_LIST);
 
 		this.signature = signature;
@@ -87,6 +90,7 @@ public class ArbitraryDataFileListMessage extends Message {
 		this.requestTime = requestTime;
 		this.requestHops = requestHops;
 		this.peerAddress = peerAddress;
+		this.nodeId = nodeId;
 		this.isRelayPossible = isRelayPossible;
         this.isDirectConnectable = isDirectConnectable;
 	}
@@ -109,6 +113,10 @@ public class ArbitraryDataFileListMessage extends Message {
 
 	public String getPeerAddress() {
 		return this.peerAddress;
+	}
+
+	public String getNodeId() {
+		return this.nodeId;
 	}
 
 	public Boolean isRelayPossible() {
@@ -135,6 +143,7 @@ public class ArbitraryDataFileListMessage extends Message {
 		Long requestTime = null;
 		Integer requestHops = null;
 		String peerAddress = null;
+		String nodeId = null;
 		boolean isRelayPossible = true; // Legacy versions only send this message when relaying is possible
         boolean isDirectConnectable = false;
 		// The remaining fields are optional
@@ -145,7 +154,7 @@ public class ArbitraryDataFileListMessage extends Message {
 				requestHops = bytes.getInt();
 
 				peerAddress = Serialization.deserializeSizedStringV2(bytes, PeerData.MAX_PEER_ADDRESS_SIZE);
-
+				nodeId = Serialization.deserializeSizedStringV2(bytes, NetworkData.MAX_NODEID_SIZE);
                 int connData = bytes.getInt();
 				isRelayPossible = (connData == RELAY_ONLY || connData == DC_AND_RELAY);
                 isDirectConnectable = (connData == DC_AND_RELAY || connData == DC_ONLY) ;
@@ -155,7 +164,7 @@ public class ArbitraryDataFileListMessage extends Message {
 			}
 		}
 
-		return new ArbitraryDataFileListMessage(id, signature, hashes, requestTime, requestHops, peerAddress, isRelayPossible, isDirectConnectable);
+		return new ArbitraryDataFileListMessage(id, signature, hashes, requestTime, requestHops, peerAddress, nodeId, isRelayPossible, isDirectConnectable);
 	}
 
 }

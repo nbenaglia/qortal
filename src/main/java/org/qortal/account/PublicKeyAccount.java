@@ -1,41 +1,47 @@
 package org.qortal.account;
 
-import org.bouncycastle.crypto.generators.Ed25519KeyPairGenerator;
-import org.bouncycastle.crypto.params.Ed25519KeyGenerationParameters;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.bouncycastle.crypto.params.Ed25519PublicKeyParameters;
 import org.qortal.crypto.Crypto;
 import org.qortal.data.account.AccountData;
 import org.qortal.repository.Repository;
-
-import java.security.SecureRandom;
+import java.util.Arrays;
 
 public class PublicKeyAccount extends Account {
 
 	protected final byte[] publicKey;
 	protected final Ed25519PublicKeyParameters edPublicKeyParams;
+	private static final Logger LOGGER = LogManager.getLogger(PublicKeyAccount.class);
+	public static final byte[] ALL_ZEROS = new byte[32];
 
 	/** <p>Constructor for generating a PublicKeyAccount</p>
 	 *
 	 * @param repository Block Chain
 	 * @param publicKey 32 byte Public Key
 	 * @since v4.7.3
+	 * @since v6.0.0 - Updated for Bouncy Castle v1.73
 	 */
 	public PublicKeyAccount(Repository repository, byte[] publicKey) {
-		super(repository, Crypto.toAddress(publicKey));
+        super(repository, Crypto.toAddress(publicKey));
+
+		this.publicKey = publicKey;
+
+		if (Arrays.equals(publicKey, ALL_ZEROS)) {
+			LOGGER.trace("We were passed a null public key");
+			this.edPublicKeyParams = null;
+			return;
+		}
 
 		Ed25519PublicKeyParameters t = null;
+
 		try {
 			t = new Ed25519PublicKeyParameters(publicKey, 0);
 		} catch (Exception e) {
-			var gen = new Ed25519KeyPairGenerator();
-			gen.init(new Ed25519KeyGenerationParameters(new SecureRandom()));
-			var keyPair = gen.generateKeyPair();
-			t = (Ed25519PublicKeyParameters) keyPair.getPublic();
-		} finally {
-			this.edPublicKeyParams = t;
+			LOGGER.error("Failed to generate public key");
 		}
 
-		this.publicKey = publicKey;
+		this.edPublicKeyParams = t;
 	}
 
 	protected PublicKeyAccount(Repository repository, Ed25519PublicKeyParameters edPublicKeyParams) {

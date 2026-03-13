@@ -106,8 +106,8 @@ public class Settings {
 	private boolean apiLoggingEnabled = false;
 	private boolean apiDocumentationEnabled = false;
 	// Both of these need to be set for API to use SSL
-	private String sslKeystorePathname = null;
-	private String sslKeystorePassword = null;
+	private String sslKeystorePathname = "QortalKeyStore.jks";
+	private String sslKeystorePassword = "default";
 
 	// Domain mapping
 	private Integer domainMapPort;
@@ -223,9 +223,9 @@ public class Settings {
 	/** Minimum number of peers to allow block minting / synchronization. */
 	private int minBlockchainPeers = 3;
 	/** Target number of outbound connections to peers we should make. */
-	private int minOutboundPeers = 32;
+	private int minOutboundPeers = 16;
 	/** Maximum number of peer connections we allow. */
-	private int maxPeers = 64;
+	private int maxPeers = 32;
 	/** Number of slots to reserve for QDN data transfers */
 	private int maxDataPeers = 64;
 	/** Maximum number of threads for network engine. */

@@ -14,6 +14,7 @@ import org.apache.logging.log4j.core.LoggerContext;
 import org.apache.logging.log4j.core.config.Configuration;
 import org.apache.logging.log4j.core.config.LoggerConfig;
 import org.qortal.api.*;
+import org.qortal.api.model.ConnectedDataPeer;
 import org.qortal.api.model.ConnectedPeer;
 import org.qortal.api.model.PeersSummary;
 import org.qortal.controller.Controller;
@@ -103,15 +104,15 @@ public class PeersResource {
 									mediaType = MediaType.APPLICATION_JSON,
 									array = @ArraySchema(
 											schema = @Schema(
-													implementation = ConnectedPeer.class
+													implementation = ConnectedDataPeer.class
 											)
 									)
 							)
 					)
 			}
 	)
-	public List<ConnectedPeer> getDataPeers() {
-		return NetworkData.getInstance().getImmutableConnectedPeers().stream().map(ConnectedPeer::new).collect(Collectors.toList());
+	public List<ConnectedDataPeer> getDataPeers() {
+		return NetworkData.getInstance().getImmutableConnectedPeers().stream().map(ConnectedDataPeer::new).collect(Collectors.toList());
 	}
 
 	@POST
@@ -290,7 +291,7 @@ public class PeersResource {
 			final LoggerContext ctx = (LoggerContext) LogManager.getContext(false);
 			final Configuration config = ctx.getConfiguration();
 
-			String epcClassName = "org.qortal.network.Network.NetworkProcessor";
+			String epcClassName = "org.qortal.network.Network";
 			LoggerConfig loggerConfig = config.getLoggerConfig(epcClassName);
 			LoggerConfig specificConfig = loggerConfig;
 

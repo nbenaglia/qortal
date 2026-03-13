@@ -31,15 +31,25 @@ public class PeerInfo {
     public boolean isDirect;
     
     /**
+     * Number of chunks this peer has available for the current request.
+     */
+    public int chunksAvailable;
+    
+    /**
      * Default constructor for JAXB serialization.
      */
     public PeerInfo() {
     }
     
     public PeerInfo(String id, Speed speed, boolean isDirect) {
+        this(id, speed, isDirect, 0);
+    }
+    
+    public PeerInfo(String id, Speed speed, boolean isDirect, int chunksAvailable) {
         this.id = id;
         this.speed = speed;
         this.isDirect = isDirect;
+        this.chunksAvailable = chunksAvailable;
     }
 }
 

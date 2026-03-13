@@ -624,6 +624,13 @@ public class OnlineAccountsManager {
                 // Make sure to verify before adding
                 if (verifyMemoryPoW(ourOnlineAccountData, null)) {
                     ourOnlineAccounts.add(ourOnlineAccountData);
+                } else {
+                    LOGGER.warn("Computed nonce failed local verification for account {} timestamp {} nonce {} (difficulty {}, buffer {})",
+                            Base58.encode(publicKey),
+                            onlineAccountsTimestamp,
+                            nonce,
+                            getPoWDifficulty(onlineAccountsTimestamp),
+                            getPoWBufferSize());
                 }
             }
 
@@ -631,8 +638,16 @@ public class OnlineAccountsManager {
 
             boolean hasInfoChanged = addAccounts(ourOnlineAccounts);
 
-            if (!hasInfoChanged)
+            if (!hasInfoChanged) {
+                if (!ourOnlineAccounts.isEmpty()) {
+                    long matchingCount = this.currentOnlineAccounts.getOrDefault(onlineAccountsTimestamp, Collections.emptySet()).stream()
+                            .filter(a -> ourOnlineAccounts.stream().anyMatch(our -> Arrays.equals(our.getPublicKey(), a.getPublicKey())))
+                            .count();
+                    LOGGER.info("No online-account cache update for timestamp {} despite {} locally verified account(s); matching pubkey entries currently in cache: {}",
+                            onlineAccountsTimestamp, ourOnlineAccounts.size(), matchingCount);
+                }
                 return false;
+            }
 
             Network.getInstance().broadcast(peer -> new OnlineAccountsV3Message(ourOnlineAccounts));
 
@@ -811,6 +826,7 @@ public class OnlineAccountsManager {
     // Utils
 
     public void removeAllOnlineAccounts() {
+        LOGGER.warn("removeAllOnlineAccounts() called - clearing current online accounts cache", new IllegalStateException("removeAllOnlineAccounts caller trace"));
         this.currentOnlineAccounts.clear();
     }
 

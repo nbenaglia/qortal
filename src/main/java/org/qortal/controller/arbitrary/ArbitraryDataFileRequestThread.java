@@ -6,6 +6,7 @@ import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -14,6 +15,7 @@ import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
+import java.util.function.Function;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -45,6 +47,8 @@ public class ArbitraryDataFileRequestThread {
 
     // Batching configuration
     private static final int MAX_BATCH_SIZE = 40;        // Maximum chunks per batch
+    private static final int INITIAL_BATCH_SIZE = 10;    // Smaller first batch to avoid overloading bad peers
+    private static final long BATCH_RAMP_UP_MS = 5000L; // Use INITIAL_BATCH_SIZE until this many ms since fetch started
     private static final long BATCH_INTERVAL_MS = 2000L;  // Interval between batches
     private static final long STALE_BATCH_TIMEOUT_MS = 300000L; // 5 minutes - remove batches that haven't completed
 
@@ -126,6 +130,17 @@ public class ArbitraryDataFileRequestThread {
         return INSTANCE;
     }
 
+    /**
+     * Called when a chunk is successfully received and saved. Removes the chunk from the batch's
+     * pending set so it is no longer retried. Called from ArbitraryDataFileManager.receivedArbitraryDataFile.
+     */
+    public void onChunkReceived(String signature58, String hash58) {
+        SignatureBatch batch = signatureBatches.get(signature58);
+        if (batch != null) {
+            batch.pendingChunks.remove(hash58);
+        }
+    }
+
     public void processFileHashes(Long now, List<ArbitraryFileListResponseInfo> responseInfos, ArbitraryDataFileManager arbitraryDataFileManager) throws InterruptedException, MessageException {
         if (Controller.isStopping()) {
             shutdownFileFetcherPool();
@@ -136,6 +151,12 @@ public class ArbitraryDataFileRequestThread {
         Map<String, List<ArbitraryFileListResponseInfo>> responseInfoBySignature58 = new HashMap<>();
 
         PeerList completeConnectedPeers = NetworkData.getInstance().getImmutableHandshakedPeers();
+
+        // Single snapshot of connected peers and nodeId->Peer map so we don't call getImmutableConnectedPeers() per response
+        PeerList connectedPeersForNodeId = NetworkData.getInstance().getImmutableConnectedPeers();
+        Map<String, Peer> nodeIdToPeer = connectedPeersForNodeId.stream()
+                .filter(p -> p.getPeersNodeId() != null)
+                .collect(Collectors.toMap(Peer::getPeersNodeId, Function.identity(), (existing, replacement) -> existing));
 
         // Remove any pending direct connects that have exceeded the timeout, increment others
         for (Map.Entry<String, Integer> peerTimeLapse : arbitraryDataFileManager.getPeerTimeOuts().entrySet()) {
@@ -165,7 +186,7 @@ public class ArbitraryDataFileRequestThread {
                 Peer connectedPeer = NetworkData.getInstance().getPeerByPeerAddress( peerAddress );
 
                 if (connectedPeer == null)
-                    LOGGER.warn("connectedPeer is null, not connected");
+                    LOGGER.debug("connectedPeer is null, not connected, {}", peerString);
                 //if (connectedPeer != null && completeConnectedPeers.contains(connectedPeer)) {            // If the peer is now connected
                 if (connectedPeer != null ) {            // If the peer is now connected
                     LOGGER.trace("We are adding responseInfos from the queue");
@@ -179,6 +200,9 @@ public class ArbitraryDataFileRequestThread {
         if (responseInfos.isEmpty())
             return;
 
+        // Decode each unique signature58 once (shared across many responses) instead of per response
+        Map<String, byte[]> decodedSignatureBySignature58 = new HashMap<>();
+
         for( ArbitraryFileListResponseInfo responseInfo : responseInfos) {
 
             if( responseInfo == null ) continue;
@@ -187,52 +211,53 @@ public class ArbitraryDataFileRequestThread {
                 return;
             }
 
+            // Skip if we recently finished fetching this resource (avoids work for late file_list responses)
+            if (arbitraryDataFileManager.isSignatureRecentlyCompleted(responseInfo.getSignature58())) {
+                continue;
+            }
+
             Boolean isDirectlyConnectable = responseInfo.isDirectConnectable();
             LOGGER.trace("Is Directly Connectable: {}", isDirectlyConnectable);
-            // Resolve Peer from connected peers - getPeer() returns null for lightweight storage
-            Peer peer = responseInfo.getPeer(completeConnectedPeers);
-            if (peer == null) {
-                // Try to find peer by PeerData
-                peer = completeConnectedPeers.get(responseInfo.getPeerData());
-            }
-            Peer connectedPeer = peer;
 
-            // Check if the peer we want a chunk from is directly connected?
-            if (connectedPeer != null) {
-                // We have a connected peer
-                LOGGER.trace("Found connected peer for responseInfo: {}", connectedPeer);
+            // Direct: we're connected to the content holder — resolve by nodeId (from single snapshot map).
+            // Relay: we're connected to the sender (relay) — resolve by PeerData using handshaked snapshot.
+            Peer connectedPeer = null;
+            if (Boolean.TRUE.equals(isDirectlyConnectable)) {
+                String nodeId = responseInfo.getNodeId();
+                if (nodeId != null) {
+                    connectedPeer = nodeIdToPeer.get(nodeId);
+                }
             } else {
-                LOGGER.trace("We did not find a directly connected peer for : {}", responseInfo.getPeerData());
+                PeerData peerData = responseInfo.getPeerData();
+                if (peerData != null) {
+                    connectedPeer = completeConnectedPeers.get(peerData);
+                    if (connectedPeer != null) {
+                        LOGGER.trace("Relay: resolved peer by PeerData: {}", peerData.getAddress());
+                    }
+                }
             }
 
-            // INSERT LOGIC FORK HERE....
-            if (isDirectlyConnectable) {
-                if (connectedPeer == null) { // Peer is not connected
-                    // Create a Peer from PeerData if peer is null (peer not in connected list yet)
-                    if (peer == null) {
-                        PeerData peerData = responseInfo.getPeerData();
-                        if (peerData != null) {
-                            peer = new Peer(peerData, Peer.NETWORKDATA);
-                            // Mark as data peer and set appropriate connection age timeout (30 minutes)
-                            peer.setIsDataPeer(true);
-                          
-                        } else {
-                            LOGGER.warn("Cannot create Peer: PeerData is null for responseInfo with hash {}", responseInfo.getHash58());
-                            continue;
-                        }
-                    }
-                    // put the response info into a queue tied to this peers connection completed
-                    arbitraryDataFileManager.addResponseToPending(peer, responseInfo);
 
-                    if (!arbitraryDataFileManager.getIsConnectingPeer(peer.toString())) {  // If not tracking the peer in adfm
+            if (Boolean.TRUE.equals(isDirectlyConnectable)) {
+                if (connectedPeer == null) {
+                    // Peer not connected - create Peer from PeerData if needed for pending/connect
+                    Peer peer;
+                    PeerData peerData = responseInfo.getPeerData();
+                    if (peerData != null) {
+                        peer = new Peer(peerData, Peer.NETWORKDATA);
+                    } else {
+                        LOGGER.warn("Cannot create Peer: PeerData is null for responseInfo with hash {}", responseInfo.getHash58());
+                        continue;
+                    }
+                    arbitraryDataFileManager.addResponseToPending(peer, responseInfo);
+                    if (!arbitraryDataFileManager.getIsConnectingPeer(peer.toString())) {
                         LOGGER.trace("Forcing Connect for QDN to: {}", peer);
                         arbitraryDataFileManager.setIsConnecting(peer.toString(), true);
-                        NetworkData.getInstance().forceConnectPeer(peer);
-                        Thread.sleep(50);
+                        NetworkData.getInstance().forceConnectPeerAsync(peer);
                     }
                     continue;
                 }
-                if (now - responseInfo.getTimestamp() >= ArbitraryDataManager.ARBITRARY_RELAY_TIMEOUT || responseInfo.getSignature58() == null || peer == null) {
+                if (now - responseInfo.getTimestamp() >= ArbitraryDataManager.ARBITRARY_RELAY_TIMEOUT || responseInfo.getSignature58() == null) {
                     LOGGER.trace("TIMED OUT in ArbitraryDataFileRequestThread");
                     continue;
                 }
@@ -240,26 +265,34 @@ public class ArbitraryDataFileRequestThread {
 
             // Skip if already requesting, but don't remove, as we might want to retry later
             if (arbitraryDataFileManager.arbitraryDataFileRequests.containsKey(responseInfo.getHash58())) {
-            //     // Already requesting - leave this attempt for later
-            //     // @ToDo : don't think this next statement is true, this is why we are queueing up multiple requests for the same thing
-            //     //arbitraryDataFileManager.addResponse(responseInfo); // don't remove -> adding back, because it was removed already above
                 continue;
             }
 
-            byte[] hash = Base58.decode(responseInfo.getHash58());
-            byte[] signature = Base58.decode(responseInfo.getSignature58());
+             // Decode signature once per unique signature58 (many responses share the same signature)
+             byte[] signature = decodedSignatureBySignature58.computeIfAbsent(responseInfo.getSignature58(), k -> Base58.decode(k));
 
-            // check for null
-            if (signature == null || hash == null || peer == null) {
-                LOGGER.trace("Signature was null or hash was null or peer was null");
+            // We resolve by nodeId only; nodeId is always present, so we need connectedPeer to fetch
+            if (signature == null || connectedPeer == null) {
+                LOGGER.trace("Signature was null or hash was null or no connected peer for fetch (by nodeId)");
                 continue;
             }
+
+            // Store responseInfo that carries the nodeId-resolved peer so getPeer/getAvailablePeers use the same connection
+            ArbitraryFileListResponseInfo infoToAdd = new ArbitraryFileListResponseInfo(
+                    responseInfo.getHash58(),
+                    responseInfo.getSignature58(),
+                    connectedPeer,
+                    responseInfo.getNodeId(),
+                    responseInfo.getTimestamp(),
+                    responseInfo.getRequestTime(),
+                    responseInfo.getRequestHops(),
+                    responseInfo.isDirectConnectable());
 
             // We want to process this file, store and map data to process later
             signatureBySignature58.put(responseInfo.getSignature58(), signature);
             responseInfoBySignature58 // Can contain different peers
                     .computeIfAbsent(responseInfo.getSignature58(), signature58 -> new ArrayList<>())
-                    .add(responseInfo);
+                    .add(infoToAdd);
         }
 
         // if there are no signatures, then there is nothing to process and nothing query the database
@@ -290,6 +323,8 @@ public class ArbitraryDataFileRequestThread {
                 
                 String signature58 = Base58.encode(data.getSignature());
                 String metadataHash58 = Base58.encode(metadataHash);
+                // Cache metadata hash so receivedArbitraryDataFile can skip DB fetch for non-metadata chunks
+                arbitraryDataFileManager.setMetadataHashForSignature(data.getSignature(), metadataHash);
                 List<ArbitraryFileListResponseInfo> responseInfoList = responseInfoBySignature58.get(signature58);
                 
                 if (responseInfoList == null || responseInfoList.isEmpty()) {
@@ -331,11 +366,8 @@ public class ArbitraryDataFileRequestThread {
                                     try {
                                         GetArbitraryDataFileMessage message = new GetArbitraryDataFileMessage(
                                             data.getSignature(), metadataHash);
-                                        
-                                        
-                                        
                                         // Queue message through PeerSendManager (same as batch system)
-                                        PeerSendManagement.getInstance().getOrCreateSendManager(peer)
+                                        PeerSendManagement.getInstance().getOrCreateSendManager(peer, true)
                                             .queueMessage(message, metadataHash58);
                                     } catch (MessageException e) {
                                         LOGGER.error("Failed to queue immediate metadata request for hash {}: {}", 
@@ -474,6 +506,7 @@ public class ArbitraryDataFileRequestThread {
                             responseInfo.getHash58(),
                             responseInfo.getSignature58(),
                             finalPeer,  // Use the final connected peer
+                            responseInfo.getNodeId(),
                             responseInfo.getTimestamp(),
                             responseInfo.getRequestTime(),
                             responseInfo.getRequestHops(),
@@ -495,7 +528,7 @@ public class ArbitraryDataFileRequestThread {
                 if (isNewBatch && batch.initialBatchSent.compareAndSet(false, true)) {
                     if (!batch.pendingChunks.isEmpty()) {
                         LOGGER.trace("Sending initial batch for signature {} with {} chunks", signature58, batch.pendingChunks.size());
-                        sendBatchForSignature(batch, MAX_BATCH_SIZE, arbitraryDataFileManager, true);
+                        sendBatchForSignature(batch, INITIAL_BATCH_SIZE, arbitraryDataFileManager, true, null);
                     } else {
                         // If no chunks yet, reset the flag so it can be sent later
                         batch.initialBatchSent.set(false);
@@ -553,10 +586,17 @@ public class ArbitraryDataFileRequestThread {
     public static class PeerDetails {
         public final Peer peer;
         public final boolean isDirect;
+        /** Number of chunks this peer has available for this request. */
+        public final int chunksAvailable;
         
         public PeerDetails(Peer peer, boolean isDirect) {
+            this(peer, isDirect, 1);
+        }
+        
+        public PeerDetails(Peer peer, boolean isDirect, int chunksAvailable) {
             this.peer = peer;
             this.isDirect = isDirect;
+            this.chunksAvailable = chunksAvailable;
         }
     }
 
@@ -596,13 +636,13 @@ public class ArbitraryDataFileRequestThread {
                 // Make peer effectively final for lambda
                 final Peer finalPeer = peer;
                 
-                // Only add if not already present (or merge isDirect status)
+                // Only add if not already present (or merge isDirect and count chunks)
                 peerDetailsMap.compute(peerData, (key, existing) -> {
                     if (existing != null) {
-                        // Merge: if ANY chunk is direct, mark as direct
-                        return new PeerDetails(finalPeer, existing.isDirect || isDirectFinal);
+                        // Merge: if ANY chunk is direct, mark as direct; sum chunk count
+                        return new PeerDetails(finalPeer, existing.isDirect || isDirectFinal, existing.chunksAvailable + 1);
                     } else {
-                        return new PeerDetails(finalPeer, isDirectFinal);
+                        return new PeerDetails(finalPeer, isDirectFinal, 1);
                     }
                 });
             }
@@ -623,6 +663,10 @@ public class ArbitraryDataFileRequestThread {
                 return;
             }
 
+
+            // One snapshot per run so sendBatchForSignature does not take N snapshots (one per batch)
+            PeerList connectedPeers = NetworkData.getInstance().getImmutableHandshakedPeers();
+
             // Process each active batch
             Iterator<Map.Entry<String, SignatureBatch>> iterator = signatureBatches.entrySet().iterator();
             while (iterator.hasNext()) {
@@ -634,13 +678,14 @@ public class ArbitraryDataFileRequestThread {
                 // Remove stale batches that have been around too long (prevents memory leak from stuck chunks)
                 if (elapsed > STALE_BATCH_TIMEOUT_MS) {
                     int remainingChunks = batch.pendingChunks.size();
+                    ArbitraryDataFileManager.getInstance().clearTriedPeersForSignature(batch.signature58);
                     iterator.remove();
                     LOGGER.warn("Removed stale batch for signature {} (age: {}s, {} chunks remaining)", 
                                 batch.signature58, elapsed / 1000, remainingChunks);
                     continue;
                 }
                 
-                // Count remaining chunks (chunks are removed from pendingChunks after successful queue)
+                // Count remaining chunks (chunks removed on receive via onChunkReceived, or when no peer available)
                 int remainingChunks = batch.pendingChunks.size();
                 
                 LOGGER.trace("Signature {}: {} chunks remaining to request (elapsed: {}s)", 
@@ -651,6 +696,7 @@ public class ArbitraryDataFileRequestThread {
                     // This prevents race condition where chunks are added right after we check
                     long idleTime = now - batch.lastUpdatedTime;
                     if (idleTime > 5000) {  // 5 seconds
+                        ArbitraryDataFileManager.getInstance().clearTriedPeersForSignature(batch.signature58);
                         iterator.remove();
                         LOGGER.trace("Removed completed batch for signature {} (all chunks requested, idle for {}ms)", 
                                     batch.signature58, idleTime);
@@ -659,8 +705,11 @@ public class ArbitraryDataFileRequestThread {
                                      batch.signature58, idleTime);
                     }
                 } else {
-                    // Send incremental batch (normal operation)
-                    sendBatchForSignature(batch, MAX_BATCH_SIZE, ArbitraryDataFileManager.getInstance(), false);
+                    // Send incremental batch (normal operation). Use smaller batch until ramp-up period has passed.
+                    int batchLimit = (elapsed >= BATCH_RAMP_UP_MS) ? MAX_BATCH_SIZE : INITIAL_BATCH_SIZE;
+                    LOGGER.trace("Sending incremental batch for signature {}: limit {} chunks (elapsed {}s)", 
+                            batch.signature58, batchLimit, elapsed / 1000);
+                            sendBatchForSignature(batch, batchLimit, ArbitraryDataFileManager.getInstance(), false, connectedPeers);
                 }
             }
         } catch (Exception e) {
@@ -726,14 +775,19 @@ public class ArbitraryDataFileRequestThread {
         List<PeerCandidate> tier2 = new ArrayList<>(); // Medium hops (2-3)
         List<PeerCandidate> tier3 = new ArrayList<>(); // High hops (4+)
         
+        Set<String> triedPeers = adfm.getTriedPeersForChunk(signature58, chunk.responseInfo.getHash58());
         for (Peer peer : peerSnapshots.get(chunk)) {
             Peer connectedPeer = availablePeersMap.get(peer.getPeerData());
             if (connectedPeer == null) {
                 continue; // Skip disconnected peers
             }
             
-            // Check if this peer is in cooldown for this file (sent invalid data for ANY chunk of this file before)
             String peerAddress = connectedPeer.getPeerData().getAddress().toString();
+            if (triedPeers.contains(peerAddress)) {
+                continue; // Already tried this peer for this chunk (timeout or in-flight); retry from another peer
+            }
+            
+            // Check if this peer is in cooldown for this file (sent invalid data for ANY chunk of this file before)
             if (adfm.isSignaturePeerInCooldown(signature58, peerAddress)) {
                 LOGGER.debug("Skipping peer {} for file {} - in 10min cooldown due to previous hash mismatch on this file", 
                     peerAddress, signature58);
@@ -744,7 +798,7 @@ public class ArbitraryDataFileRequestThread {
             int currentLoad = chunksByPeer.getOrDefault(connectedPeer, Collections.emptyList()).size();
             
             // Factor 2: Queue size (number of queued messages)
-            PeerSendManager sendManager = PeerSendManagement.getInstance().getOrCreateSendManager(connectedPeer);
+            PeerSendManager sendManager = PeerSendManagement.getInstance().getOrCreateSendManager(connectedPeer, true);
             int queueSize = sendManager.getQueueMessageSize() + connectedPeer.getSendQueueSize();
             
             // Factor 3: Round trip time (lower is better)
@@ -889,8 +943,9 @@ public class ArbitraryDataFileRequestThread {
      * @param requestedMaxChunks requested maximum number of chunks to send per peer (may be reduced adaptively)
      * @param adfm the ArbitraryDataFileManager instance
      * @param isInitialBatch true if this is the initial batch (uses hop-priority sorting), false for incremental batches
+     * @param connectedPeersSnapshot optional snapshot of handshaked peers; if null, a fresh snapshot is taken (avoids repeated snapshots when caller passes one from processAllBatches)
      */
-    private void sendBatchForSignature(SignatureBatch batch, int requestedMaxChunks, ArbitraryDataFileManager adfm, boolean isInitialBatch) {
+    private void sendBatchForSignature(SignatureBatch batch, int requestedMaxChunks, ArbitraryDataFileManager adfm, boolean isInitialBatch, PeerList connectedPeersSnapshot) {
         // Use cached transaction data, or fetch lazily on first use
         ArbitraryTransactionData transactionData = batch.transactionData;
         if (transactionData == null) {
@@ -917,8 +972,8 @@ public class ArbitraryDataFileRequestThread {
             }
         }
 
-        // Get current connected peers snapshot
-        PeerList connectedPeers = NetworkData.getInstance().getImmutableHandshakedPeers();
+        // Use caller-provided snapshot when available (e.g. from processAllBatches) to avoid repeated getImmutableHandshakedPeers() per batch
+        PeerList connectedPeers = connectedPeersSnapshot != null ? connectedPeersSnapshot : NetworkData.getInstance().getImmutableHandshakedPeers();
 
         // Get all unrequested chunks
         List<PendingChunk> unrequestedChunks = batch.pendingChunks.values().stream()
@@ -1002,6 +1057,11 @@ public class ArbitraryDataFileRequestThread {
                 
                 if (selectedPeer != null) {
                     chunksByPeer.computeIfAbsent(selectedPeer, k -> new ArrayList<>()).add(chunk);
+                } else {
+                    // No peer available (e.g. all tried for this chunk) - remove so we don't retry forever
+                    String hash58 = chunk.responseInfo.getHash58();
+                    batch.pendingChunks.remove(hash58);
+                    adfm.clearChunkReceived(hash58, batch.signature58);
                 }
             }
         } else {
@@ -1024,6 +1084,10 @@ public class ArbitraryDataFileRequestThread {
                 
                 if (selectedPeer != null) {
                     chunksByPeer.computeIfAbsent(selectedPeer, k -> new ArrayList<>()).add(chunk);
+                } else {
+                    String hash58 = chunk.responseInfo.getHash58();
+                    batch.pendingChunks.remove(hash58);
+                    adfm.clearChunkReceived(hash58, batch.signature58);
                 }
             }
         }
@@ -1047,7 +1111,7 @@ public class ArbitraryDataFileRequestThread {
             // Check peer's queue capacity using RTT-aware calculation
             // Need to check both PeerSendManager queue and Peer sendQueue since messages flow:
             // Batching → PeerSendManager.queue → Peer.sendQueue → network
-            PeerSendManager sendManager = PeerSendManagement.getInstance().getOrCreateSendManager(peer);
+            PeerSendManager sendManager = PeerSendManagement.getInstance().getOrCreateSendManager(peer, true);
             int sendManagerQueueSize = sendManager.getQueueMessageSize();
             int peerSendQueueSize = peer.getSendQueueSize();
             int peerSendQueueCapacity = peer.getSendQueueCapacity();
@@ -1086,7 +1150,7 @@ public class ArbitraryDataFileRequestThread {
             // Minimum of 1 chunk ensures even slow peers can make progress without blocking downloads
             int maxChunksForThisPeer = Math.max(1, Math.min(Math.min(maxChunks, maxSafeChunks), availableQueueSpace));
             
-            LOGGER.info("REQUESTER QUEUE STATUS: peer={}, PeerSendMgr={}, Peer.sendQueue={}/{}, queue={}, RTT={}ms, drainTime={}s, sendingChunks={}", 
+            LOGGER.trace("REQUESTER QUEUE STATUS: peer={}, PeerSendMgr={}, Peer.sendQueue={}/{}, queue={}, RTT={}ms, drainTime={}s, sendingChunks={}", 
                 peer, sendManagerQueueSize, peerSendQueueSize, peerSendQueueCapacity, 
                 totalPendingMessages, effectiveRTT, queueDrainTimeMs / 1000, maxChunksForThisPeer);
             
@@ -1097,7 +1161,7 @@ public class ArbitraryDataFileRequestThread {
             int sentToThisPeer = 0;
             for (PendingChunk chunk : chunksForThisPeer) {
                 // Re-check queue space before each message (in case it changed)
-                PeerSendManager currentSendManager = PeerSendManagement.getInstance().getOrCreateSendManager(peer);
+                PeerSendManager currentSendManager = PeerSendManagement.getInstance().getOrCreateSendManager(peer, true);
                 int currentSendManagerQueueSize = currentSendManager.getQueueMessageSize();
                 int currentPeerSendQueueSize = peer.getSendQueueSize();
                 int currentTotalPending = currentSendManagerQueueSize + currentPeerSendQueueSize;
@@ -1124,10 +1188,7 @@ public class ArbitraryDataFileRequestThread {
                 // This prevents duplicate requests when multiple threads process the same chunk
                 Long prev = adfm.arbitraryDataFileRequests.putIfAbsent(fileHash, NTP.getTime());
                 if (prev != null) {
-                    // Another thread already marked this as requesting - skip
-                   
-                    // Remove chunk from batch tracking to prevent memory leak
-                    batch.pendingChunks.remove(fileHash);
+                    // Another thread already marked this as requesting - skip (chunk stays in pending for retry if that request times out)
                     continue;
                 }
                 
@@ -1144,19 +1205,17 @@ public class ArbitraryDataFileRequestThread {
                     peer.getDownloadSpeedTracker().recordChunkAssigned();
                     
                     // Pass fileHash for tracking in PeerSendManager pipeline
-                    PeerSendManagement.getInstance().getOrCreateSendManager(peer).queueMessage(message, fileHash);
+                    PeerSendManagement.getInstance().getOrCreateSendManager(peer, true).queueMessage(message, fileHash);
                     
+                    adfm.recordChunkRequested(fileHash, batch.signature58, peer.getPeerData().getAddress().toString());
                     sentToThisPeer++;
                     totalSent++;
-                    // Remove chunk from batch tracking after successful queue
-                    batch.pendingChunks.remove(fileHash);
+                    // Chunk stays in pendingChunks until we receive it (onChunkReceived) or cleanup expires the request
                 } catch (MessageException e) {
                     LOGGER.error("Failed to create or queue message for hash {}: {}", fileHash, e.getMessage());
-                    // Remove from request tracking since we failed to send
                     adfm.arbitraryDataFileRequests.remove(fileHash);
-                    // Separately remove from guard map
                     adfm.removeGuardTracking(fileHash);
-                    batch.pendingChunks.remove(fileHash);
+                    // Chunk stays in pendingChunks so we can retry from another peer
                 }
             }
 

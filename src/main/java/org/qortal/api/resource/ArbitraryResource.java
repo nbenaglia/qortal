@@ -371,8 +371,8 @@ public class ArbitraryResource {
 	@GET
 	@Path("/resource/request/peers/{service}/{name}")
 	@Operation(
-			summary = "Get peer count for an active file request (default resource)",
-			description = "Returns the number of peers available for downloading chunks for the specified resource. Returns empty result if no active request is found.",
+			summary = "Get peer information for an active file request (default resource)",
+			description = "Returns detailed information about peers available for downloading chunks for the specified resource (default/latest). Each peer includes how many chunks they have available. Returns empty result if no active request is found.",
 			responses = {
 					@ApiResponse(
 							content = @Content(
@@ -393,7 +393,7 @@ public class ArbitraryResource {
 	@Path("/resource/request/peers/{service}/{name}/{identifier}")
 	@Operation(
 			summary = "Get peer information for an active file request",
-			description = "Returns detailed information about peers available for downloading chunks for the specified resource. Returns empty result if no active request is found.",
+			description = "Returns detailed information about peers available for downloading chunks for the specified resource. Each peer includes how many chunks they have available. Returns empty result if no active request is found.",
 			responses = {
 					@ApiResponse(
 							content = @Content(
@@ -454,7 +454,7 @@ public class ArbitraryResource {
 					}
 				}
 				
-				peerInfoList.add(new PeerInfo(id, speed, isDirect));
+				peerInfoList.add(new PeerInfo(id, speed, isDirect, entry.getValue().chunksAvailable));
 			}
 			
 			// Sort by speed (HIGH first, then LOW, then IDLE) then by id for consistent ordering
@@ -692,6 +692,7 @@ public class ArbitraryResource {
 				arbitraryResourceData.name = transactionData.getName();
 				arbitraryResourceData.service = transactionData.getService();
 				arbitraryResourceData.identifier = transactionData.getIdentifier();
+				arbitraryResourceData.latestSignature = transactionData.getSignature();
 				if (!resources.contains(arbitraryResourceData)) {
 					resources.add(arbitraryResourceData);
 				}
@@ -2251,12 +2252,12 @@ public String finalizeUpload(
 	
 
 	} catch (IOException | ApiException | DataException e) {
-			LOGGER.warn(String.format("Unable to load %s %s: %s", service, name, e.getMessage()));
+			LOGGER.debug(String.format("Unable to load %s %s: %s", service, name, e.getMessage()));
 			if (!response.isCommitted()) {
 				throw ApiExceptionFactory.INSTANCE.createCustomException(request, ApiError.FILE_NOT_FOUND, e.getMessage());
 			}
 		} catch (NumberFormatException e) {
-			LOGGER.warn(String.format("Invalid range for %s %s: %s", service, name, e.getMessage()));
+			LOGGER.debug(String.format("Invalid range for %s %s: %s", service, name, e.getMessage()));
 			if (!response.isCommitted()) {
 				throw ApiExceptionFactory.INSTANCE.createCustomException(request, ApiError.INVALID_DATA, e.getMessage());
 			}

@@ -83,7 +83,7 @@ public class Peer {
 	 * <p>
 	 * Just under every 30s is usually ideal to keep NAT mappings refreshed.
 	 */
-	private static final int PING_INTERVAL = 20_000; // ms
+	private static final int PING_INTERVAL = 40_000; // ms
 
 	/**
 	 * Maximum time to wait for a peer to respond with blocks (ms)
@@ -176,7 +176,6 @@ public class Peer {
     // Peer info
 
     private final Object peerInfoLock = new Object();
-
     private String peersNodeId;
     private byte[] peersPublicKey;
     private byte[] peersChallenge;
@@ -302,7 +301,7 @@ public class Peer {
         return this.peerType;
     }
     public Object getPeerCapability(String capName) {
-        return peerCapabilities.getCapability(capName);
+        return peerCapabilities == null ? null : peerCapabilities.getCapability(capName);
     }
 
     public Handshake getHandshakeStatus() {
@@ -715,9 +714,9 @@ public class Peer {
 
         this.socketChannel.configureBlocking(false);
         if (network == Peer.NETWORK)
-            Network.getInstance().setInterestOps(this.socketChannel, SelectionKey.OP_READ);
+            Network.getInstance().registerPeerChannel(this.socketChannel, this);
         else
-            NetworkData.getInstance().setInterestOps(this.socketChannel, SelectionKey.OP_READ);
+            NetworkData.getInstance().registerPeerChannel(this.socketChannel, this);
         this.byteBuffer = null; // Defer allocation to when we need it, to save memory. Sorry GC!
 
         Random random = new SecureRandom();
@@ -900,16 +899,11 @@ public class Peer {
                             this.peerConnectionId, message.getType().name(), this, 
                             this.handshakeStatus, this.handshakeMessagePending);
 
-                    // Prematurely end any blocking channel select so that new messages can be processed.
-                    // This might cause this.socketChannel.read() above to return zero into bytesRead.
-                    switch (this.peerType) {
-                        case Peer.NETWORK:
-                            Network.getInstance().wakeupChannelSelector();
-                            break;
-                        case Peer.NETWORKDATA:
-                            NetworkData.getInstance().wakeupChannelSelector();
-                            break;
-                    }
+                    // No wakeup needed here: readChannel() is always called from the IO thread itself,
+                    // which is not in select() at this point. The queued message will be drained to the
+                    // worker pool later in the same runIOLoop() iteration (the readPeersThisRound drain),
+                    // so calling wakeup() would only cause the next select() to return immediately as a
+                    // no-op, wasting a loop iteration.
                 }
             }
         }
@@ -1165,58 +1159,6 @@ public class Peer {
     }
 
     /**
-     * Checks if a specific hash is currently queued in this peer's internal sendQueue
-     * as a GetArbitraryDataFileMessage.
-     * 
-     * <p>This method takes a snapshot of the sendQueue and checks each message to see
-     * if it's a GetArbitraryDataFileMessage with the matching hash. This is useful for
-     * preventing duplicate requests when cleaning up expired request tracking.
-     *
-     * @param hash58 the hash to check for, encoded in base58
-     * @return {@code true} if a GetArbitraryDataFileMessage with this hash is queued, otherwise {@code false}
-     */
-    public boolean isHashInSendQueue(String hash58) {
-        if (sendQueue.isEmpty()) {
-            return false;
-        }
-        
-        byte[] targetHash = Base58.decode(hash58);
-        if (targetHash == null) {
-            return false;
-        }
-        
-        // Take a snapshot of the queue to avoid concurrent modification issues
-        Object[] queueSnapshot = sendQueue.toArray();
-        
-        for (Object obj : queueSnapshot) {
-            if (!(obj instanceof Message)) {
-                continue;
-            }
-            
-            Message message = (Message) obj;
-            try {
-                // Check if it's a GetArbitraryDataFileMessage
-                if (message.getType() == MessageType.GET_ARBITRARY_DATA_FILE) {
-                    GetArbitraryDataFileMessage getMessage = (GetArbitraryDataFileMessage) message;
-                    byte[] messageHash = getMessage.getHash();
-                    
-                    // Compare hashes
-                    if (messageHash != null && Arrays.equals(targetHash, messageHash)) {
-                        return true;
-                    }
-                }
-            } catch (Exception e) {
-                // If we can't check the message, skip it
-                // This can happen if message type doesn't match or casting fails
-                continue;
-            }
-        }
-        
-        return false;
-    }
-
-
-    /**
      * Get the current size of the send queue.
      *
      * @return number of messages currently queued for sending
@@ -1361,7 +1303,6 @@ public class Peer {
                     getConnectionAge(), reason);
         }
         LOGGER.trace("peer.disconnect because {} - peer : {} - on Network {}", reason, peersNodeId, peerType);
-
         try {
             this.shutdown();
         } catch (Exception e) {
@@ -1445,7 +1386,7 @@ public class Peer {
         boolean logStats = false;
 
         if (!isStopping) {
-            LOGGER.info("[{}] Shutting down peer {}", this.peerConnectionId, this);
+            LOGGER.debug("[{}] Shutting down peer {}", this.peerConnectionId, this);
             logStats = true;
         }
         isStopping = true;

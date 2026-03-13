@@ -151,7 +151,17 @@ public enum Handshake {
 
 			// If public key matches our public key then we've connected to self
 			// CRITICAL: Check for null to prevent NPE during Network initialization
-			byte[] ourPublicKey = Network.getInstance().getOurPublicKey();
+			// Use the key for this connection type (Network vs NetworkData)
+			byte[] ourPublicKey;
+			switch (peer.getPeerType()) {
+				case Peer.NETWORKDATA:
+					ourPublicKey = NetworkData.getInstance().getOurPublicKey();
+					break;
+				case Peer.NETWORK:
+				default:
+					ourPublicKey = Network.getInstance().getOurPublicKey();
+					break;
+			}
 			if (ourPublicKey != null && Arrays.equals(ourPublicKey, peersPublicKey)) {
 				// If outgoing connection then record destination as self so we don't try again
 				if (peer.isOutbound()) {
@@ -365,7 +375,17 @@ public enum Handshake {
 		public void action(Peer peer) {
 			// Send challenge
 			LOGGER.debug("STARTING CHALLENGE SEND - RESPONSE TO HELLO on {}", peer.getPeerType());
-			byte[] publicKey = Network.getInstance().getOurPublicKey();
+			// Use NetworkData's public key for NetworkData connections, Network's for Network
+			byte[] publicKey;
+			switch (peer.getPeerType()) {
+				case Peer.NETWORKDATA:
+					publicKey = NetworkData.getInstance().getOurPublicKey();
+					break;
+				case Peer.NETWORK:
+				default:
+					publicKey = Network.getInstance().getOurPublicKey();
+					break;
+			}
 			byte[] challenge = peer.getOurChallenge();
 
 			Message challengeMessage = new ChallengeMessage(publicKey, challenge);
@@ -389,7 +409,17 @@ public enum Handshake {
 				return null;
 			}
 
-			byte[] sharedSecret = Network.getInstance().getSharedSecret(peersPublicKey);
+			// Use same key as CHALLENGE: NetworkData for NetworkData connections, Network for Network
+			byte[] sharedSecret;
+			switch (peer.getPeerType()) {
+				case Peer.NETWORKDATA:
+					sharedSecret = NetworkData.getInstance().getSharedSecret(peersPublicKey);
+					break;
+				case Peer.NETWORK:
+				default:
+					sharedSecret = Network.getInstance().getSharedSecret(peersPublicKey);
+					break;
+			}
 			final byte[] expectedData = Crypto.digest(Bytes.concat(sharedSecret, ourChallenge));
 
 			byte[] data = responseMessage.getData();
@@ -442,7 +472,17 @@ public enum Handshake {
 				return;
 			}
 
-			byte[] sharedSecret = Network.getInstance().getSharedSecret(peersPublicKey);
+			// Use same key as CHALLENGE: NetworkData for NetworkData connections, Network for Network
+			byte[] sharedSecret;
+			switch (peer.getPeerType()) {
+				case Peer.NETWORKDATA:
+					sharedSecret = NetworkData.getInstance().getSharedSecret(peersPublicKey);
+					break;
+				case Peer.NETWORK:
+				default:
+					sharedSecret = Network.getInstance().getSharedSecret(peersPublicKey);
+					break;
+			}
 			final byte[] data = Crypto.digest(Bytes.concat(sharedSecret, peersChallenge));
 
 			// We do this in a new thread as it can take a while...
@@ -668,14 +708,22 @@ public enum Handshake {
 			return null;
 		}
 
-	int peerType = helloMessage.getPeerType();
-	if (peerType != Peer.NETWORK && peerType != Peer.NETWORKDATA) {
-			LOGGER.debug("Peer {} sent invalid peerType {} in HELLO_V2", peer, peerType);
+		int remotePeerType = helloMessage.getPeerType();
+		if (remotePeerType != Peer.NETWORK && remotePeerType != Peer.NETWORKDATA) {
+			LOGGER.debug("Peer {} sent invalid peerType {} in HELLO_V2", peer, remotePeerType);
 			return null;
 		}
-		peer.setPeerType(peerType);
 
-		switch (peerType) {
+		// The peer's type is authoritatively determined at connection time by whichever
+		// network server owns the connection. Reject if the remote claims a different type —
+		// this catches P2P connections accidentally made to QDN ports (and vice versa).
+		if (remotePeerType != peer.getPeerType()) {
+			LOGGER.debug("Rejecting HELLO_V2 from {} - remote claimed peerType {} but connection belongs to peerType {}",
+					peer, remotePeerType, peer.getPeerType());
+			return null;
+		}
+
+		switch (peer.getPeerType()) {
 			case Peer.NETWORK:
 				Network.getInstance().ourPeerAddressUpdated(helloMessage.getSenderPeerAddress());
 				break;

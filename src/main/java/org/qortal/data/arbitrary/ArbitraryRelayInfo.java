@@ -17,15 +17,17 @@ public class ArbitraryRelayInfo {
     private final String hash58;
     private final String signature58;
     private final PeerData peerData;  // Store lightweight PeerData instead of heavy Peer object
+    private final String nodeId;
     private final Long timestamp;
     private final Long requestTime;
     private final Integer requestHops;
     private final Boolean isDirectConnectable;
 
-    public ArbitraryRelayInfo(String hash58, String signature58, Peer peer, Long timestamp, Long requestTime, Integer requestHops, Boolean isDirectConnectable) {
+    public ArbitraryRelayInfo(String hash58, String signature58, Peer peer, String nodeId, Long timestamp, Long requestTime, Integer requestHops, Boolean isDirectConnectable) {
         this.hash58 = hash58;
         this.signature58 = signature58;
         this.peerData = peer != null ? peer.getPeerData() : null;  // Extract PeerData immediately
+        this.nodeId = nodeId;
         this.timestamp = timestamp;
         this.requestTime = requestTime;
         this.requestHops = requestHops;
@@ -43,6 +45,10 @@ public class ArbitraryRelayInfo {
 
     public String getSignature58() {
         return signature58;
+    }
+
+    public String getNodeId() {
+        return this.nodeId;
     }
 
     /**

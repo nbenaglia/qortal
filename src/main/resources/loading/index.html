@@ -559,9 +559,8 @@
         document.querySelector(".progress-bar-container").style.display = "block";
         document.querySelector(".progress-bar").style.width = progressPercent + "%";
         
-        // Show peer count if total chunks >= 200 and actively downloading
         // Don't show if READY, DOWNLOADED, or BUILDING
-        if (status.totalChunkCount >= 200 && status.id == "DOWNLOADING") {
+        if (status.id == "DOWNLOADING" || status.id == "MISSING_DATA") {
           const now = Date.now();
           const timeSinceLastPeerFetch = now - checkStatus.state.lastPeerCountFetch;
           

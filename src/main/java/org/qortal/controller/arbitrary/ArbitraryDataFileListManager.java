@@ -726,17 +726,17 @@ public class ArbitraryDataFileListManager {
                             PeerAddress pa = PeerAddress.fromString(peerWithFilesString); // HOST:PORT
                             PeerData pd = new PeerData(pa,now, "INIT");
                             Peer peerWithFiles = new Peer(pd, Peer.NETWORKDATA);
-
+                            String nodeId = arbitraryDataFileListMessage.getNodeId();
                             // Update Response based on Content Holder being able to access direct connect
                             ArbitraryFileListResponseInfo responseInfo;
 
                             if(arbitraryDataFileListMessage.isDirectConnectable()) {
                                 responseInfo = new ArbitraryFileListResponseInfo(hash58, signature58,
-                                        peerWithFiles, now, arbitraryDataFileListMessage.getRequestTime(), requestHops, true);
+                                        peerWithFiles, nodeId, now, arbitraryDataFileListMessage.getRequestTime(), requestHops, true);
                                 LOGGER.debug("Adding QDN Direct Connect responseInfo to ArbDataFileManager peer: {} FileHash: {}", peerWithFilesString, hash58);
                             } else { // We have to relay the peers chunks because they cant Direct Connect
                                 responseInfo = new ArbitraryFileListResponseInfo(hash58, signature58,
-                                        peer, now, arbitraryDataFileListMessage.getRequestTime(), requestHops, false);
+                                        peer, nodeId, now, arbitraryDataFileListMessage.getRequestTime(), requestHops, false);
                                 LOGGER.trace("Adding QDN Relay-able responseInfo to ArbDataFileManager peer: {} FileHash: {}", peer, hash58);
                             }
                             ArbitraryDataFileManager.getInstance().addResponse(responseInfo);
@@ -745,7 +745,7 @@ public class ArbitraryDataFileListManager {
                         // Keep track of the source peer, for direct connections
                         if (arbitraryDataFileListMessage.getPeerAddress() != null) {
                             ArbitraryDataFileManager.getInstance().addDirectConnectionInfoIfUnique(
-                                    new ArbitraryDirectConnectionInfo(signature, arbitraryDataFileListMessage.getPeerAddress(), hashes, now));
+                                    new ArbitraryDirectConnectionInfo(signature, arbitraryDataFileListMessage.getPeerAddress(), arbitraryDataFileListMessage.getNodeId(), hashes, now));
                         }
                     }
 
@@ -759,12 +759,12 @@ public class ArbitraryDataFileListManager {
                             Long requestTime = arbitraryDataFileListMessage.getRequestTime();
                             Integer requestHops = arbitraryDataFileListMessage.getRequestHops();
                             Boolean isDirectConnectable = arbitraryDataFileListMessage.isDirectConnectable();
-
+                            String nodeId = arbitraryDataFileListMessage.getNodeId();
                             // Add each hash to our local mapping so we know who to ask later
                             Long now = NTP.getTime();
                             for (byte[] hash : hashes) {
                                 String hash58 = Base58.encode(hash);
-                                ArbitraryRelayInfo relayInfo = new ArbitraryRelayInfo(hash58, signature58, peer, now, requestTime, requestHops, isDirectConnectable);
+                                ArbitraryRelayInfo relayInfo = new ArbitraryRelayInfo(hash58, signature58, peer, nodeId, now, requestTime, requestHops, isDirectConnectable);
                                 ArbitraryDataFileManager.getInstance().addToRelayMap(relayInfo);
                             }
 
@@ -774,7 +774,7 @@ public class ArbitraryDataFileListManager {
                             }
 
                             ArbitraryDataFileListMessage forwardArbitraryDataFileListMessage = new ArbitraryDataFileListMessage(signature, hashes, requestTime, requestHops,
-                                    arbitraryDataFileListMessage.getPeerAddress(), arbitraryDataFileListMessage.isRelayPossible(), arbitraryDataFileListMessage.isDirectConnectable());
+                                    arbitraryDataFileListMessage.getPeerAddress(), arbitraryDataFileListMessage.getNodeId(), arbitraryDataFileListMessage.isRelayPossible(), arbitraryDataFileListMessage.isDirectConnectable());
 
                             forwardArbitraryDataFileListMessage.setId(message.getId());
 
@@ -1032,8 +1032,9 @@ public class ArbitraryDataFileListManager {
 
                     Collections.shuffle(hashes.subList(1, hashes.size()));
 
+                    String nodeId = NetworkData.getInstance().getOurNodeId();
                     arbitraryDataFileListMessage = new ArbitraryDataFileListMessage(signature,
-                        hashes, NTP.getTime(), 0, ourAddress, this.isRelayAvailable, this.getIsDirectConnectable());
+                        hashes, NTP.getTime(), 0, ourAddress, nodeId, this.isRelayAvailable, this.getIsDirectConnectable());
 
                     arbitraryDataFileListMessage.setId(message.getId());
 

@@ -25,11 +25,13 @@ public class PeerSendManager {
     private static final long MAX_MESSAGE_AGE_MS = 30_000L; // 30 seconds - drop messages older than this to prevent sending stale data
     
     // Two-stage pipeline architecture: disk I/O threads -> sender threads
-    private static final int DISK_IO_THREAD_COUNT = 8; // Parallel disk readers to hide I/O latency
+    private static final int DISK_IO_THREAD_COUNT_NETWORK = 1; // Blockchain peers: low chunk volume
+    private static final int DISK_IO_THREAD_COUNT_DATA = 2; // NetworkData peers: chunk streams (25–50/sec)
     private static final int PREFETCH_QUEUE_SIZE = 8; // 4MB memory overhead (8 × 500KB chunks) - balanced for single peer
     private static final int SENDER_THREAD_COUNT = 2; // Number of parallel sender threads per peer
 
     private final Peer peer;
+    private final int diskIOThreadCount;
     private final BlockingQueue<TimedMessage> queue = new PriorityBlockingQueue<>(2000); // Thread-safe priority queue for lazy loading
     private final BlockingQueue<PreloadedMessage> preloadedQueue = new LinkedBlockingQueue<>(PREFETCH_QUEUE_SIZE); // Queue of pre-loaded chunks ready to send
     private final ExecutorService diskIOExecutor; // Stage 1: Parallel disk I/O
@@ -53,7 +55,7 @@ public class PeerSendManager {
      *
      * <p><b>Two-Stage Pipeline Architecture:</b>
      * <ul>
-     *   <li><b>Stage 1 - Disk I/O:</b> 8 threads read chunks from disk in parallel, hiding 10-100ms disk latency</li>
+     *   <li><b>Stage 1 - Disk I/O:</b> 1 thread (network peer) or 4 threads (data peer) read chunks from disk in parallel</li>
      *   <li><b>Stage 2 - Network Send:</b> 2 threads send pre-loaded chunks over network with zero disk blocking</li>
      * </ul>
      *
@@ -68,7 +70,7 @@ public class PeerSendManager {
      * <p>This class is responsible for:
      * <ul>
      *   <li>Queuing messages with optional priority ordering.</li>
-     *   <li>Parallel disk I/O to hide latency (8 threads).</li>
+     *   <li>Parallel disk I/O to hide latency (1 or 4 threads depending on peer type).</li>
      *   <li>Non-blocking network transmission (2 threads).</li>
      *   <li>Gracefully shutting down when requested.</li>
      * </ul>
@@ -94,11 +96,12 @@ public class PeerSendManager {
      * @updated v5.0.3 - Added lazy loading support for large messages
      * @updated v5.0.8 - Refactored to two-stage pipeline architecture for 5-10× performance improvement
      */
-    public PeerSendManager(Peer peer) {
+    public PeerSendManager(Peer peer, boolean isNetworkDataPeer) {
         this.peer = peer;
-        
-        // Stage 1: Disk I/O thread pool (8 threads for parallel disk reads)
-        this.diskIOExecutor = Executors.newFixedThreadPool(DISK_IO_THREAD_COUNT, r -> {
+        this.diskIOThreadCount = isNetworkDataPeer ? DISK_IO_THREAD_COUNT_DATA : DISK_IO_THREAD_COUNT_NETWORK;
+
+        // Stage 1: Disk I/O thread pool (thread count depends on network vs data peer)
+        this.diskIOExecutor = Executors.newFixedThreadPool(this.diskIOThreadCount, r -> {
             Thread t = new Thread(r);
             t.setName("DiskIO-" + peer.getResolvedAddress().getHostString() + "-" + threadCount.getAndIncrement());
             return t;
@@ -124,7 +127,7 @@ public class PeerSendManager {
      * 
      * <p>Benefits:
      * <ul>
-     *   <li>8 concurrent disk reads hide 10-100ms disk latency</li>
+     *   <li>Multiple concurrent disk reads hide 10-100ms disk latency (data peers)</li>
      *   <li>Sender threads never block on disk I/O</li>
      *   <li>Network continuously fed with data</li>
      *   <li>Bounded memory usage (32 chunks × 500KB = 16MB max)</li>
@@ -134,7 +137,7 @@ public class PeerSendManager {
      * @author Ice
      */
     private void startDiskIOStage() {
-        for (int i = 0; i < DISK_IO_THREAD_COUNT; i++) {
+        for (int i = 0; i < this.diskIOThreadCount; i++) {
             diskIOExecutor.submit(() -> {
                 while (!Thread.currentThread().isInterrupted()) {
                     try {
@@ -145,6 +148,7 @@ public class PeerSendManager {
                             LOGGER.trace("Peer {} no longer connected in disk I/O stage, clearing {} queued messages", 
                                        peer, queue.size());
                             queue.clear();
+                            queuedHashes.clear(); // Allow request timeout to retry chunks from other peers
                             return;
                         }
                         
@@ -277,6 +281,7 @@ public class PeerSendManager {
                         LOGGER.trace("Peer {} no longer connected in sender stage, clearing {} preloaded messages", 
                                    peer, preloadedQueue.size());
                         preloadedQueue.clear();
+                        queuedHashes.clear(); // Allow request timeout to retry chunks from other peers
                         return;
                     }
                     

@@ -263,6 +263,10 @@ public enum Service {
         return this.requiresValidation || this.single;
     }
 
+    public Long getMaxSize() {
+        return this.maxSize;
+    }
+
     public boolean isPrivate() {
         return this.isPrivate;
     }

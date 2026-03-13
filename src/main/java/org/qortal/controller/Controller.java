@@ -35,6 +35,7 @@ import org.qortal.gui.SysTray;
 import org.qortal.network.Network;
 import org.qortal.network.NetworkData;
 import org.qortal.network.Peer;
+import org.qortal.network.PeerSendManagement;
 import org.qortal.network.PeerAddress;
 import org.qortal.network.message.*;
 import org.qortal.repository.*;
@@ -438,6 +439,7 @@ public class Controller extends Thread {
 				ArbitraryDataCacheManager.getInstance().buildArbitraryResourcesCache(repository, false);
 			}
 
+
 			if( Settings.getInstance().isDbCacheEnabled() ) {
 				LOGGER.info("Starting Db Cache...");
 				HSQLDBDataCacheManager hsqldbDataCacheManager = new HSQLDBDataCacheManager();
@@ -507,7 +509,12 @@ public class Controller extends Thread {
 			}
 		}
 
+	
+
 		try (Repository repository = RepositoryManager.getRepository()) {
+
+			ArbitraryDataCacheManager.populateLatestSignaturesIfNecessary(repository.getConnection());
+		
 			if (RepositoryManager.needsTransactionSequenceRebuild(repository)) {
 				// Don't allow the node to start if transaction sequences haven't been built yet
 				// This is needed to handle a case when bootstrapping
@@ -887,20 +894,24 @@ public class Controller extends Thread {
 						LOGGER.warn(String.format("Repository issue when trying to prune peers: %s", e.getMessage()));
 					}
 					
-					// Check EPC health to detect critical thread issues
+					// Check worker pool health to detect critical thread issues
+					// Note: After refactor to dedicated I/O threads, 0 active threads means "idle worker pool"
+					// not "dead system". The I/O threads run independently and always service sockets.
+					// Only warn if pool stats are unavailable (indicates shutdown or initialization issue).
 					try {
 						ExecuteProduceConsume.StatsSnapshot networkStats = Network.getInstance().getStatsSnapshot();
 						ExecuteProduceConsume.StatsSnapshot networkDataStats = NetworkData.getInstance().getStatsSnapshot();
 						
-						// CRITICAL: Warn if either EPC has no active threads
-						if (networkStats.activeThreadCount == 0) {
-							LOGGER.error("CRITICAL: Network EPC has 0 active threads! Network processing has stopped!");
+						// Log high activity for monitoring, but 0 active threads is now normal when idle
+						if (networkStats.activeThreadCount > 50) {
+							LOGGER.trace("Network worker pool has high activity: {} active threads", networkStats.activeThreadCount);
 						}
-						if (networkDataStats.activeThreadCount == 0) {
-							LOGGER.error("CRITICAL: NetworkData EPC has 0 active threads! Data network processing has stopped!");
+						if (networkDataStats.activeThreadCount > 15) {
+							LOGGER.trace("NetworkData worker pool has high activity: {} active threads", networkDataStats.activeThreadCount);
 						}
 					} catch (Exception e) {
-						LOGGER.warn("Failed to get EPC stats: {}", e.getMessage());
+						// This would indicate a more serious problem (e.g., Network not initialized)
+						LOGGER.error("CRITICAL: Failed to get worker pool stats (system may not be initialized): {}", e.getMessage());
 					}
 				}
 
@@ -1215,6 +1226,7 @@ public class Controller extends Thread {
 				LOGGER.info("Shutting down networking");
 				Network.getInstance().shutdown();
 				NetworkData.getInstance().shutdown();
+				PeerSendManagement.getInstance().shutdown();
 
 				LOGGER.info("Shutting down controller");
 				this.interrupt();
@@ -1563,37 +1575,6 @@ public class Controller extends Thread {
 				ForeignFeesManager.getInstance().onNetworkForeignFeesMessage(peer, message);
 				break;
 
-			case GET_ARBITRARY_DATA:
-				// Not currently supported
-				break;
-
-			case ARBITRARY_DATA_FILE_LIST:
-				ArbitraryDataFileListManager.getInstance().onNetworkArbitraryDataFileListMessage(peer, message);
-				break;
-// @ToDo: Future Message Type to get an entire list of file Hashes
-//			case GET_ARBITRARY_DATA_FILES:
-//				ArbitraryDataFileManager.getInstance().onNetworkGetArbitraryDataFilesMessage(peer, message);
-//				break;
-
-			case GET_ARBITRARY_DATA_FILE:
-				ArbitraryDataFileManager.getInstance().onNetworkGetArbitraryDataFileMessage(peer, message);
-				break;
-
-		case GET_ARBITRARY_DATA_FILE_LIST:
-			ArbitraryDataFileListManager.getInstance().onNetworkGetArbitraryDataFileListMessage(peer, message);
-			break;
-
-			case ARBITRARY_SIGNATURES:
-				// Not currently supported
-				break;
-
-			case GET_ARBITRARY_METADATA:
-				ArbitraryMetadataManager.getInstance().onNetworkGetArbitraryMetadataMessage(peer, message);
-				break;
-
-			case ARBITRARY_METADATA:
-				ArbitraryMetadataManager.getInstance().onNetworkArbitraryMetadataMessage(peer, message);
-				break;
 
 			case GET_TRADE_PRESENCES:
 				TradeBot.getInstance().onGetTradePresencesMessage(peer, message);

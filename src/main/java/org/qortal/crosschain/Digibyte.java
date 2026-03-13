@@ -142,7 +142,6 @@ public class Digibyte extends Bitcoiny {
 
 	public static synchronized Digibyte getInstance() {
 		if (instance == null && Settings.getInstance().isWalletEnabled("DGB")) {
-            LOGGER.info("This piece of shit it passing");
 			DigibyteNet digibyteNet = Settings.getInstance().getDigibyteNet();
 
 			BitcoinyBlockchainProvider electrumX = new ElectrumX("Digibyte-" + digibyteNet.name(), digibyteNet.getGenesisHash(), digibyteNet.getServers(), DEFAULT_ELECTRUMX_PORTS);

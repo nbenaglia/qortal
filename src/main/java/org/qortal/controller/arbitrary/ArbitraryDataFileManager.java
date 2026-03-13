@@ -1,5 +1,6 @@
 package org.qortal.controller.arbitrary;
 
+import java.nio.file.*;
 import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -54,11 +55,6 @@ import com.google.common.net.InetAddresses;
 
 import java.io.File;
 import java.io.IOException;
-import java.nio.file.FileVisitResult;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
-import java.nio.file.SimpleFileVisitor;
 import java.nio.file.attribute.BasicFileAttributes;
 
 public class ArbitraryDataFileManager extends Thread {
@@ -109,11 +105,47 @@ public class ArbitraryDataFileManager extends Thread {
     // Key format: signature58 + "|" + peerAddress, Value: timestamp when validation failed
     private final Map<String, Long> invalidHashCooldowns = new ConcurrentHashMap<>();
     private static final long INVALID_HASH_COOLDOWN_MS = 10 * 60 * 1000L; // 10 minutes
-    
+
+    /** Signatures we recently finished fetching (all chunks done). Used to skip late file_list responses. TTL 2 mins; cleaned on read and at shutdown. */
+    private final Map<String, Long> completedSignaturesWithTime = new ConcurrentHashMap<>();
+    private static final long COMPLETED_SIGNATURE_TTL_MS = 12 * 1000L; // 12 seconds
+
+    /** In-flight request: hash58 -> (signature58, peerAddress). Cleared on receive or when cleanup expires the request. */
+    private final Map<String, InFlightRequestInfo> inFlightRequestsByHash = new ConcurrentHashMap<>();
+    /** Peers we already tried for this chunk (timed out or in flight). Key: signature58 + "|" + hash58. Used to retry from another peer. */
+    private final Map<String, Set<String>> triedPeersByChunk = new ConcurrentHashMap<>();
+
+    private static class InFlightRequestInfo {
+        final String signature58;
+        final String peerAddress;
+        InFlightRequestInfo(String signature58, String peerAddress) {
+            this.signature58 = signature58;
+            this.peerAddress = peerAddress;
+        }
+    }
+
+    // Metadata hash by signature (signature58 -> entry). Populated when we have tx data at request time;
+    // used in receivedArbitraryDataFile to avoid DB fetch for every chunk - only fetch when chunk is metadata.
+    // Entry stores hash + last-insert time for TTL cleanup (entries older than 1 hour are removed).
+    private final Map<String, MetadataHashEntry> metadataHashBySignature58 = new ConcurrentHashMap<>();
+    private static final long METADATA_HASH_CACHE_TTL_MS = 60 * 60 * 1000L; // 1 hour
+    private static final long METADATA_HASH_CACHE_CLEANUP_INTERVAL_MS = 15 * 60 * 1000L; // run cleanup every 15 minutes
+
+    private static class MetadataHashEntry {
+        final byte[] metadataHash;
+        final long lastUpdatedMs;
+
+        MetadataHashEntry(byte[] metadataHash, long lastUpdatedMs) {
+            this.metadataHash = metadataHash;
+            this.lastUpdatedMs = lastUpdatedMs;
+        }
+    }
+
     // Relay cache configuration
     private static final String RELAY_CACHE_DIR_NAME = "relay-cache";
     private static final long RELAY_CACHE_CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000L; // 24 hours
-    private static final int RELAY_CACHE_CLEANUP_TRIGGER = 2000; // Trigger cleanup at ~1GB (assuming 500KB avg per file)
+    // Initially set to 1GB, adjust based on estimated cache size
+    private int RELAY_CACHE_CLEANUP_TRIGGER = 2000; // Trigger cleanup at ~1GB (assuming 500KB avg per file)
     private static final long RELAY_CACHE_MIN_FILE_AGE_MS = 5 * 60 * 1000L; // 5 minutes minimum age before deletion
     private Path relayCacheDir;
     private final AtomicInteger relayCacheFileCount = new AtomicInteger(0);
@@ -133,8 +165,7 @@ public class ArbitraryDataFileManager extends Thread {
      */
     private void initializeRelayCache() {
         try {
-            String tempDir = System.getProperty("java.io.tmpdir");
-            relayCacheDir = Paths.get(tempDir, "qortal", RELAY_CACHE_DIR_NAME);
+            this.relayCacheDir = Paths.get(Settings.getInstance().getDataPath() + File.separator + RELAY_CACHE_DIR_NAME);
             Files.createDirectories(relayCacheDir);
             
             // Count existing files on startup
@@ -146,11 +177,12 @@ public class ArbitraryDataFileManager extends Thread {
                         fileCount++;
                     }
                 }
-                relayCacheFileCount.set(fileCount);
+                this.relayCacheFileCount.set(fileCount);
                 LOGGER.debug("Initialized relay cache directory: {} ({} existing files)", relayCacheDir, fileCount);
             } else {
                 LOGGER.debug("Initialized relay cache directory: {}", relayCacheDir);
             }
+            cleanupRelayCache();  // Run cleanup in case disk conditions changed while node was offline
         } catch (IOException e) {
             LOGGER.error("Failed to initialize relay cache directory: {}", e.getMessage());
             relayCacheDir = null;
@@ -166,46 +198,55 @@ public class ArbitraryDataFileManager extends Thread {
         if (relayCacheDir == null) {
             return null;
         }
-        return relayCacheDir.resolve(hash58 + ".tmp");
+        try {
+            return relayCacheDir.resolve(hash58 + ".tmp");
+        } catch (InvalidPathException e) {
+            return null;
+        }
     }
     
     /**
      * Saves chunk data to relay cache using streaming write to avoid holding byte[] reference
-     * Triggers cleanup if file count exceeds threshold
+     * Triggers cleanup if file count exceeds threshold. Overwriting an existing file does not increment the count.
      * @param hash58 The hash of the chunk
      * @param data The chunk data
-     * @return true if saved successfully
      */
-    private boolean saveToRelayCache(String hash58, byte[] data) {
+    private void saveToRelayCache(String hash58, byte[] data) {
         if (relayCacheDir == null || data == null) {
-            return false;
+            return;
         }
-        
+
+        Path cachePath = getRelayCachePath(hash58);
+        if (cachePath == null) {
+            LOGGER.debug("Invalid relay cache path for hash {}", hash58);
+            return;
+        }
+
+        boolean isNewFile = false;
         try {
-            // Check if cleanup is needed based on file count
-            int currentCount = relayCacheFileCount.incrementAndGet();
-            if (currentCount > RELAY_CACHE_CLEANUP_TRIGGER) {
-                LOGGER.trace("Relay cache has {} files (threshold: {}), triggering cleanup", 
-                        currentCount, RELAY_CACHE_CLEANUP_TRIGGER);
-                cleanupRelayCache();
+            isNewFile = !Files.exists(cachePath);
+            if (isNewFile) {
+                int currentCount = relayCacheFileCount.incrementAndGet();
+                if (currentCount > RELAY_CACHE_CLEANUP_TRIGGER) {
+                    LOGGER.trace("Relay cache has {} files (threshold: {}), triggering cleanup",
+                            currentCount, RELAY_CACHE_CLEANUP_TRIGGER);
+                    cleanupRelayCache();
+                }
             }
-            
-            Path cachePath = getRelayCachePath(hash58);
+
             // Use streaming write to avoid holding byte[] reference in memory during I/O
-            // This allows GC to reclaim the original byte[] sooner
-            try (java.io.OutputStream out = Files.newOutputStream(cachePath, 
-                    java.nio.file.StandardOpenOption.CREATE, 
+            try (java.io.OutputStream out = Files.newOutputStream(cachePath,
+                    java.nio.file.StandardOpenOption.CREATE,
                     java.nio.file.StandardOpenOption.TRUNCATE_EXISTING,
                     java.nio.file.StandardOpenOption.WRITE)) {
                 out.write(data);
                 out.flush();
             }
-            
-            return true;
         } catch (IOException e) {
             LOGGER.warn("Failed to save to relay cache for hash {}: {}", hash58, e.getMessage());
-            relayCacheFileCount.decrementAndGet(); // Rollback counter on failure
-            return false;
+            if (isNewFile) {
+                relayCacheFileCount.decrementAndGet(); // Rollback counter on failure
+            }
         }
     }
     
@@ -221,10 +262,12 @@ public class ArbitraryDataFileManager extends Thread {
         
         try {
             Path cachePath = getRelayCachePath(hash58);
-            if (Files.exists(cachePath)) {
-                byte[] data = Files.readAllBytes(cachePath);
-               
-                return data;
+            try {
+                if (Files.exists(cachePath)) {
+                    return Files.readAllBytes(cachePath);
+                }
+            } catch (SecurityException e) { // unable to read directory or file
+                return null;
             }
         } catch (IOException e) {
             LOGGER.warn("Failed to load from relay cache for hash {}: {}", hash58, e.getMessage());
@@ -291,7 +334,8 @@ public class ArbitraryDataFileManager extends Thread {
                     // Use up to 10% of the headroom, with min/max bounds
                     long calculatedSize = (long)(qortalHeadroom * 0.10);
                     maxAllowedSize = Math.max(500L * 1024 * 1024, // Min 500MB
-                                     Math.min(calculatedSize, 5L * 1024 * 1024 * 1024)); // Max 5GB
+                                              calculatedSize);    // 10% of free Qortal QDN Space
+                    RELAY_CACHE_CLEANUP_TRIGGER = (int)(maxAllowedSize / (512L * 1024)); // 500KB avg per file
                     LOGGER.debug("Relay cache limit: {} MB (based on {}% of {} MB headroom)", 
                             maxAllowedSize / (1024 * 1024), 
                             (int)(0.10 * 100),
@@ -469,9 +513,9 @@ public class ArbitraryDataFileManager extends Thread {
             });
             
             // Update file count
-            relayCacheFileCount.set(0);
-            
             int failed = failedCount.get();
+            relayCacheFileCount.set(failed);
+
             if (failed > 0) {
                 LOGGER.warn("Erased relay cache: deleted {} files, {} failed", deletedCount - failed, failed);
             } else {
@@ -523,7 +567,7 @@ public class ArbitraryDataFileManager extends Thread {
         initializeRelayCache();
         
         this.arbitraryDataFileHashResponseScheduler.scheduleAtFixedRate(this::processResponses, 60, 1, TimeUnit.SECONDS);
-        this.arbitraryDataFileHashResponseScheduler.scheduleAtFixedRate(this::handleFileListRequestProcess, 60, 1, TimeUnit.SECONDS);
+        this.handleFileListRequestsScheduler.scheduleAtFixedRate(this::handleFileListRequestProcess, 60_000, 250, TimeUnit.MILLISECONDS);
 
         // Clean up stale pending relay forwards and disconnected peers
         cleaner.scheduleAtFixedRate(() -> {
@@ -562,10 +606,15 @@ public class ArbitraryDataFileManager extends Thread {
             }
         }, 30, 30, TimeUnit.SECONDS);
         
-        // Clean up relay cache every hour
+        // Clean up relay cache every 24 hours
         cleaner.scheduleAtFixedRate(() -> {
             cleanupRelayCache();
         }, RELAY_CACHE_CLEANUP_INTERVAL_MS, RELAY_CACHE_CLEANUP_INTERVAL_MS, TimeUnit.MILLISECONDS);
+
+        // Clean up metadata-hash cache: remove entries older than 1 hour (runs every 15 minutes)
+        cleaner.scheduleAtFixedRate(() -> {
+            cleanupMetadataHashCache();
+        }, METADATA_HASH_CACHE_CLEANUP_INTERVAL_MS, METADATA_HASH_CACHE_CLEANUP_INTERVAL_MS, TimeUnit.MILLISECONDS);
     }
 
     public static ArbitraryDataFileManager getInstance() {
@@ -573,6 +622,49 @@ public class ArbitraryDataFileManager extends Thread {
             instance = new ArbitraryDataFileManager();
 
         return instance;
+    }
+
+    /**
+     * Cache metadata hash for a signature so we can avoid DB fetch for non-metadata chunks.
+     * Call this when we have ArbitraryTransactionData (e.g. when processing file list responses).
+     * Each insertion updates the entry's timestamp so recently requested resources stay in the cache.
+     */
+    public void setMetadataHashForSignature(byte[] signature, byte[] metadataHash) {
+        if (signature == null || metadataHash == null) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        metadataHashBySignature58.put(Base58.encode(signature), new MetadataHashEntry(metadataHash, now));
+    }
+
+    /**
+     * Get cached metadata hash for a signature, or null if not cached.
+     */
+    public byte[] getMetadataHashForSignature(byte[] signature) {
+        if (signature == null) {
+            return null;
+        }
+        MetadataHashEntry entry = metadataHashBySignature58.get(Base58.encode(signature));
+        return entry != null ? entry.metadataHash : null;
+    }
+
+    /**
+     * Remove metadata-hash cache entries older than {@link #METADATA_HASH_CACHE_TTL_MS}.
+     */
+    private void cleanupMetadataHashCache() {
+        long now = System.currentTimeMillis();
+        long cutoff = now - METADATA_HASH_CACHE_TTL_MS;
+        int removed = 0;
+        for (Iterator<Map.Entry<String, MetadataHashEntry>> it = metadataHashBySignature58.entrySet().iterator(); it.hasNext(); ) {
+            Map.Entry<String, MetadataHashEntry> e = it.next();
+            if (e.getValue().lastUpdatedMs < cutoff) {
+                it.remove();
+                removed++;
+            }
+        }
+        if (removed > 0) {
+            LOGGER.debug("Cleaned up {} stale metadata-hash cache entries (older than 1 hour)", removed);
+        }
     }
 
     @Override
@@ -596,12 +688,17 @@ public class ArbitraryDataFileManager extends Thread {
         LOGGER.info("Shutting down ArbitraryDataFileManager schedulers...");
         
         arbitraryDataFileHashResponseScheduler.shutdown();
+        handleFileListRequestsScheduler.shutdown();
         cleaner.shutdown();
         
         try {
             if (!arbitraryDataFileHashResponseScheduler.awaitTermination(5, TimeUnit.SECONDS)) {
                 LOGGER.warn("arbitraryDataFileHashResponseScheduler did not terminate in time, forcing shutdown");
                 arbitraryDataFileHashResponseScheduler.shutdownNow();
+            }
+            if (!handleFileListRequestsScheduler.awaitTermination(5, TimeUnit.SECONDS)) {
+                LOGGER.warn("handleFileListRequestsScheduler did not terminate in time, forcing shutdown");
+                handleFileListRequestsScheduler.shutdownNow();
             }
             if (!cleaner.awaitTermination(5, TimeUnit.SECONDS)) {
                 LOGGER.warn("cleaner scheduler did not terminate in time, forcing shutdown");
@@ -610,47 +707,15 @@ public class ArbitraryDataFileManager extends Thread {
         } catch (InterruptedException e) {
             LOGGER.warn("Interrupted while shutting down schedulers, forcing shutdown");
             arbitraryDataFileHashResponseScheduler.shutdownNow();
+            handleFileListRequestsScheduler.shutdownNow();
             cleaner.shutdownNow();
             Thread.currentThread().interrupt();
         }
-        
+        completedSignaturesWithTime.clear();
         LOGGER.info("ArbitraryDataFileManager schedulers shut down successfully");
         
         // Interrupt the main thread
         this.interrupt();
-    }
-
-    /**
-     * Checks if a hash is currently queued in any peer's send queue.
-     * 
-     * <p>This method iterates through all handshaked peers and checks their send queues
-     * to see if a GetArbitraryDataFileMessage with the specified hash is queued.
-     * This is useful for preventing duplicate requests when cleaning up expired
-     * request tracking.
-     *
-     * @param hash58 the hash to check for, encoded in base58
-     * @return {@code true} if the hash is queued in any peer's send queue, otherwise {@code false}
-     */
-    private boolean isHashQueuedInAnyPeer(String hash58) {
-        PeerList connectedPeers = NetworkData.getInstance().getImmutableHandshakedPeers();
-        
-        for (Peer peer : connectedPeers) {
-            // Check Stage 3: Peer.sendQueue (final network send queue)
-            if (peer.isHashInSendQueue(hash58)) {
-                LOGGER.trace("Hash {} is queued in peer {} send queue (Stage 3)", hash58, peer);
-                return true;
-            }
-            
-            // Check Stages 1 & 2: PeerSendManager queues (disk I/O and preload queues)
-            // Uses O(1) hash map lookup instead of scanning queues
-            PeerSendManager sendManager = PeerSendManagement.getInstance().getSendManager(peer);
-            if (sendManager != null && sendManager.isHashQueued(hash58)) {
-                LOGGER.trace("Hash {} is queued in PeerSendManager for peer {} (Stage 1/2)", hash58, peer);
-                return true;
-            }
-        }
-        
-        return false;
     }
 
     /**
@@ -702,20 +767,68 @@ public class ArbitraryDataFileManager extends Thread {
         return (now - cooldownTime) < INVALID_HASH_COOLDOWN_MS;
     }
 
+    /**
+     * Records that we requested a chunk from a peer. Used so we can retry from a different peer on timeout.
+     */
+    public void recordChunkRequested(String hash58, String signature58, String peerAddress) {
+        inFlightRequestsByHash.put(hash58, new InFlightRequestInfo(signature58, peerAddress));
+        triedPeersByChunk.computeIfAbsent(signature58 + "|" + hash58, k -> ConcurrentHashMap.newKeySet()).add(peerAddress);
+    }
+
+    /**
+     * Clears in-flight and tried state when we successfully receive the chunk.
+     */
+    public void clearChunkReceived(String hash58, String signature58) {
+        inFlightRequestsByHash.remove(hash58);
+        triedPeersByChunk.remove(signature58 + "|" + hash58);
+    }
+
+    /**
+     * Returns peer addresses we already tried for this chunk (so we don't retry from the same peer).
+     */
+    public Set<String> getTriedPeersForChunk(String signature58, String hash58) {
+        Set<String> tried = triedPeersByChunk.get(signature58 + "|" + hash58);
+        return tried != null ? Collections.unmodifiableSet(new HashSet<>(tried)) : Collections.emptySet();
+    }
+
+    /**
+     * Clears tried-peers state for a signature when its batch is removed (prevents memory leak).
+     */
+    public void clearTriedPeersForSignature(String signature58) {
+        String prefix = signature58 + "|";
+        triedPeersByChunk.keySet().removeIf(k -> k != null && k.startsWith(prefix));
+    }
+
+
+    /** Mark a signature as recently completed (all chunks done). Entries expire after 12 seconds and are removed on read or at shutdown. */
+    public void markSignatureCompleted(String signature58) {
+        completedSignaturesWithTime.put(signature58, System.currentTimeMillis());
+    }
+
+    /** True if this signature was recently completed (within TTL). Removes expired entry if found. */
+    public boolean isSignatureRecentlyCompleted(String signature58) {
+        Long completedAt = completedSignaturesWithTime.get(signature58);
+        if (completedAt == null) {
+            return false;
+        }
+        if (System.currentTimeMillis() - completedAt > COMPLETED_SIGNATURE_TTL_MS) {
+            completedSignaturesWithTime.remove(signature58);
+            return false;
+        }
+        return true;
+    }
+
     public void cleanupRequestCache(Long now) {
         if (now == null) {
             return;
         }
         final long requestMinimumTimestamp = now - ArbitraryDataManager.getInstance().ARBITRARY_REQUEST_TIMEOUT;
-        // Only remove if expired AND not queued in any peer's send queue
+        // Always remove after timeout so chunk becomes re-requestable; don't block on queue state (avoids stuck IDLE)
         arbitraryDataFileRequests.entrySet().removeIf(entry -> {
-            if (entry.getValue() == null || entry.getValue() < requestMinimumTimestamp) {
+            Long value = entry.getValue();
+            if (value == null || value < requestMinimumTimestamp) {
                 String hash58 = entry.getKey();
-                // Don't remove if still queued in any peer's send queue
-                if (isHashQueuedInAnyPeer(hash58)) {
-                    LOGGER.trace("Not removing expired hash {} from arbitraryDataFileRequests - still queued in peer send queue", hash58);
-                    return false;
-                }
+                inFlightRequestsByHash.remove(hash58);
                 return true;
             }
             return false;
@@ -954,7 +1067,7 @@ public class ArbitraryDataFileManager extends Thread {
                     
                     // Use estimated size WITHOUT loading data into memory
                     int estimatedSize = 512 * 1024;  // Typical chunk size (~500KB)
-                    PeerSendManagement.getInstance().getOrCreateSendManager(requestingPeer).queueMessageFactory(factory, estimatedSize);
+                    PeerSendManagement.getInstance().getOrCreateSendManager(requestingPeer, true).queueMessageFactory(factory, estimatedSize);
           
                 } catch (MessageException e) {
                     LOGGER.debug("Failed to queue ArbitraryDataFileMessage for relay: {}", e.getMessage());
@@ -1044,6 +1157,10 @@ public class ArbitraryDataFileManager extends Thread {
             
             // Remove from guard map now that we've successfully validated and saved
             removeGuardTracking(hash58);
+            // Clear in-flight/tried state and notify request thread to remove chunk from batch pending (enables retry on timeout)
+            String signature58 = Base58.encode(signature);
+            clearChunkReceived(hash58, signature58);
+            ArbitraryDataFileRequestThread.getInstance().onChunkReceived(signature58, hash58);
         } catch (DataException de) {
             LOGGER.error("FAILED to write hash chunk to disk!");
             // Clear fileContent even on save failure to free memory
@@ -1051,20 +1168,39 @@ public class ArbitraryDataFileManager extends Thread {
             return;
         }
 
-        ArbitraryTransactionData arbitraryTransactionData = null;
-        // Fetch the transaction data
-        try (final Repository repository = RepositoryManager.getRepository()) {
-            //arbitraryTransactionDataList.addAll(
-            //        ArbitraryTransactionUtils.fetchTransactionDataList(repository, new ArrayList<>(signatureBySignature58.values())));
-            arbitraryTransactionData = ArbitraryTransactionUtils.fetchTransactionData(repository, signature);
-        } catch (DataException e) {
-            LOGGER.warn("Unable to fetch transaction data from DB: {}", e.getMessage());
-        }
+        // Avoid DB fetch for every chunk: only fetch when this chunk might be the metadata chunk.
+        byte[] cachedMetadataHash = getMetadataHashForSignature(signature);
+        if (cachedMetadataHash != null && !Arrays.equals(cachedMetadataHash, hash)) {
+            // Cached metadata hash exists and this chunk is not it - skip DB entirely
+        } else {
+            ArbitraryTransactionData arbitraryTransactionData = null;
+            // Fetch the transaction data (cache miss, or this chunk is the metadata chunk)
+            try (final Repository repository = RepositoryManager.getRepository()) {
+                arbitraryTransactionData = ArbitraryTransactionUtils.fetchTransactionData(repository, signature);
+            } catch (DataException e) {
+                LOGGER.warn("Unable to fetch transaction data from DB: {}", e.getMessage());
+            }
 
-        // If this is a metadata file then we need to update the cache
-        if (arbitraryTransactionData != null && arbitraryTransactionData.getMetadataHash() != null) {
-            if (Arrays.equals(arbitraryTransactionData.getMetadataHash(), hash)) {
-                ArbitraryDataCacheManager.getInstance().addToUpdateQueue(arbitraryTransactionData);
+            // If this is a metadata file then we need to update the cache
+            if (arbitraryTransactionData != null && arbitraryTransactionData.getMetadataHash() != null) {
+                if (Arrays.equals(arbitraryTransactionData.getMetadataHash(), hash)) {
+                    ArbitraryDataCacheManager.getInstance().addToUpdateQueue(arbitraryTransactionData);
+                    // Remove from our metadata-hash cache so we don't retain entries forever
+                    metadataHashBySignature58.remove(Base58.encode(signature));
+                }
+            }
+             // Immediate check: if we have all chunks/complete file, clear file list request so poll can exit (no extra DB connection)
+             if (arbitraryTransactionData != null) {
+                try {
+                    if (ArbitraryTransactionUtils.completeFileExists(arbitraryTransactionData)) {
+                        String signature58 = Base58.encode(signature);
+                        ArbitraryDataFileListManager.getInstance().deleteFileListRequestsForSignature(signature58);
+                        markSignatureCompleted(signature58);
+                        
+                    }
+                } catch (DataException e) {
+                    LOGGER.warn("Unable to check complete file for file list request cleanup: {}", e.getMessage());
+                }
             }
         }
 
@@ -1113,6 +1249,7 @@ public class ArbitraryDataFileManager extends Thread {
                     LOGGER.debug("All chunks or complete file exist for transaction {}", signature58);
 
                     ArbitraryDataFileListManager.getInstance().deleteFileListRequestsForSignature(signature58);
+                    markSignatureCompleted(signature58);
                 }
             }
 
@@ -1185,6 +1322,23 @@ public class ArbitraryDataFileManager extends Thread {
                 // Remove from the list so that a different peer is tried next time
                 removeDirectConnectionInfo(directConnectionInfo);
 
+                // If we have nodeId, try to use an already-connected peer (same logic as ArbitraryDataFileRequestThread)
+                String nodeId = directConnectionInfo.getNodeId();
+                if (nodeId != null) {
+                    Peer connectedPeer = NetworkData.getInstance().getImmutableConnectedPeers().stream()
+                            .filter(peer -> peer.getPeersNodeId() != null && peer.getPeersNodeId().equals(nodeId))
+                            .findFirst()
+                            .orElse(null);
+                    if (connectedPeer != null) {
+                        success = ArbitraryDataFileListManager.getInstance().fetchArbitraryDataFileList(connectedPeer, signature);
+                        if (success) {
+                            ArbitraryDataFileListManager.getInstance().addToSignatureRequests(signature58, false, true);
+                        }
+                        // If not success, fall through to address-based connection attempts below
+                    }
+                }
+
+                if (!success) {
                 String peerAddressString = directConnectionInfo.getPeerAddress();
 
                 // Parse the peer address to find the host and port
@@ -1247,6 +1401,7 @@ public class ArbitraryDataFileManager extends Thread {
                     ArbitraryDataFileListManager.getInstance().addToSignatureRequests(signature58, false, true);
                 }
 
+                } 
             }
         } catch (InterruptedException e) {
             // Do nothing
@@ -1413,7 +1568,7 @@ public class ArbitraryDataFileManager extends Thread {
                 
                 // Estimate chunk size (~500KB typical)
                 int estimatedSize = 512 * 1024;
-                PeerSendManagement.getInstance().getOrCreateSendManager(peer).queueMessageFactory(factory, estimatedSize);
+                PeerSendManagement.getInstance().getOrCreateSendManager(peer, true).queueMessageFactory(factory, estimatedSize);
                 return; // Early return - found in permanent storage
             } else {
                 LOGGER.debug("Hash {} does not exist in permanent storage, queueing send to {}", hash58, peer);
@@ -1446,7 +1601,7 @@ public class ArbitraryDataFileManager extends Thread {
                 };
                 
                 int estimatedSize = 512 * 1024;
-                PeerSendManagement.getInstance().getOrCreateSendManager(peer).queueMessageFactory(factory, estimatedSize);
+                PeerSendManagement.getInstance().getOrCreateSendManager(peer, true).queueMessageFactory(factory, estimatedSize);
                 return; // Early return - found in relay cache, skip all relay logic
             }
             
@@ -1583,7 +1738,7 @@ public class ArbitraryDataFileManager extends Thread {
                         try {
                             GetArbitraryDataFileMessage getArbitraryDataFileMessage = new GetArbitraryDataFileMessage(sig, hash);
                             getArbitraryDataFileMessage.setId(originalMessage.getId());
-                            PeerSendManagement.getInstance().getOrCreateSendManager(relayPeer).queueMessage(getArbitraryDataFileMessage);
+                            PeerSendManagement.getInstance().getOrCreateSendManager(relayPeer, true).queueMessage(getArbitraryDataFileMessage);
                             LOGGER.debug("Successfully sent GetArbitraryDataFileMessage for hash {} to relay peer {} ({}:{})", 
                                     hash58, relayPeer, 
                                     relayPeer.getPeerData().getAddress().getHost(), 

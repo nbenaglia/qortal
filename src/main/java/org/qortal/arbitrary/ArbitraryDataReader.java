@@ -202,7 +202,7 @@ public class ArbitraryDataReader {
                 // Wait for it to complete (up to 60 seconds)
                 int maxWaitMs = 60000;
                 int waitedMs = 0;
-                int sleepMs = 500;
+                int sleepMs = 200;
                 
                 while (waitedMs < maxWaitMs) {
                     try {
@@ -264,7 +264,7 @@ public class ArbitraryDataReader {
             throw e;
 
         } catch (DataException e) {
-            LOGGER.info("DataException when trying to load QDN resource", e);
+            LOGGER.debug("DataException when trying to load QDN resource", e);
             this.deleteWorkingDirectory();
             throw e;
 

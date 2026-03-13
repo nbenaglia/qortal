@@ -218,10 +218,51 @@ public class ZipUtils {
     
 
     /**
+     * Sanitizes a zip entry name for safe extraction on all supported OS/filesystems.
+     * Removes characters that are invalid on Windows, Linux, and common FS (e.g. exFAT),
+     * and trims leading/trailing whitespace from each path segment. Preserves path structure
+     * (ZIP uses forward slash). Normal names are unchanged; only invalid chars are removed.
+     *
+     * @param entryName The raw name from the zip entry (e.g. "data/ | file.mp4")
+     * @return A safe path for extraction (e.g. "data/file.mp4")
+     */
+    private static String sanitizeZipEntryName(String entryName) {
+        if (entryName == null || entryName.isEmpty()) {
+            return "_";
+        }
+        // ZIP spec uses forward slash as path separator
+        String[] segments = entryName.split("/", -1);
+        boolean trailingSlash = entryName.endsWith("/");
+        StringBuilder out = new StringBuilder();
+        for (int i = 0; i < segments.length; i++) {
+            if (i > 0) {
+                out.append('/');
+            }
+            String segment = segments[i];
+            // Skip empty trailing segment (directory entry like "data/")
+            if (segment.isEmpty() && i == segments.length - 1 && trailingSlash) {
+                out.setLength(out.length() - 1); // remove the trailing '/' we just added
+                break;
+            }
+            // Same invalid-char set as StringUtils.sanitizeString: invalid on Windows and common FS
+            String sanitized = segment.replaceAll("[<>:\"/\\\\|?*]", "");
+            // Trim leading/trailing whitespace (e.g. " | file.mp4" -> "file.mp4" after pipe removed)
+            sanitized = sanitized.replaceAll("^\\s+|\\s+$", "");
+            if (sanitized.isEmpty()) {
+                sanitized = "_";
+            }
+            out.append(sanitized);
+        }
+        return out.toString();
+    }
+
+    /**
      * See: https://snyk.io/research/zip-slip-vulnerability
+     * Zip entry names are sanitized so extraction works on all OS/filesystems (e.g. names with | or :).
      */
     public static File newFile(File destinationDir, ZipEntry zipEntry) throws IOException {
-        File destFile = new File(destinationDir, zipEntry.getName());
+        String safeName = sanitizeZipEntryName(zipEntry.getName());
+        File destFile = new File(destinationDir, safeName);
 
         String destDirPath = destinationDir.getCanonicalPath();
         String destFilePath = destFile.getCanonicalPath();

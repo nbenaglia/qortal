@@ -15,9 +15,10 @@ public class PeerSendManagement {
     private static final Logger LOGGER = LogManager.getLogger(PeerSendManagement.class);
 
     private final Map<String, PeerSendManager> peerSendManagers = new ConcurrentHashMap<>();
+    private final ScheduledExecutorService cleaner;
 
-    public PeerSendManager getOrCreateSendManager(Peer peer) {
-        return peerSendManagers.computeIfAbsent(peer.toString(), p -> new PeerSendManager(peer));
+    public PeerSendManager getOrCreateSendManager(Peer peer, boolean isNetworkDataPeer) {
+        return peerSendManagers.computeIfAbsent(peer.toString(), p -> new PeerSendManager(peer, isNetworkDataPeer));
     }
 
     /**
@@ -55,8 +56,18 @@ public class PeerSendManagement {
     }
 
     private PeerSendManagement() {
+        this.cleaner = Executors.newSingleThreadScheduledExecutor();
 
-        ScheduledExecutorService cleaner = Executors.newSingleThreadScheduledExecutor();
+        // Clean up stale hash tracking every 60s
+        cleaner.scheduleAtFixedRate(() -> {
+            for (PeerSendManager manager : peerSendManagers.values()) {
+                try {
+                    manager.cleanupStaleHashTracking();
+                } catch (Exception e) {
+                    LOGGER.warn("Error cleaning stale hash tracking for peer {}: {}", manager.getPeer(), e.getMessage());
+                }
+            }
+        }, 60, 60, TimeUnit.SECONDS);
 
         cleaner.scheduleAtFixedRate(() -> {
             long idleCutoff = TimeUnit.MINUTES.toMillis(2);
@@ -84,6 +95,32 @@ public class PeerSendManagement {
                 }
             }
         }, 0, 5, TimeUnit.MINUTES);
+    }
+
+    /**
+     * Shuts down the scheduler and all peer send managers. Call during application shutdown.
+     */
+    public void shutdown() {
+        try {
+            cleaner.shutdown();
+            if (!cleaner.awaitTermination(5, TimeUnit.SECONDS)) {
+                LOGGER.warn("PeerSendManagement cleaner did not terminate in time, forcing shutdown");
+                cleaner.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            LOGGER.warn("Interrupted while shutting down PeerSendManagement, forcing shutdown");
+            Thread.currentThread().interrupt();
+            cleaner.shutdownNow();
+        }
+        for (PeerSendManager manager : peerSendManagers.values()) {
+            try {
+                manager.shutdown();
+            } catch (Exception e) {
+                LOGGER.warn("Error shutting down PeerSendManager: {}", e.getMessage());
+            }
+        }
+        peerSendManagers.clear();
+        LOGGER.info("PeerSendManagement shutdown complete");
     }
 
     private static PeerSendManagement instance;

@@ -184,7 +184,6 @@ public class LegacyZcashAddress extends Address {
         return p2sh ? ScriptType.P2SH : ScriptType.P2PKH;
     }
 
-    @Override
     public int compareTo(Address address) {
         return this.toString().compareTo(address.toString());
     }

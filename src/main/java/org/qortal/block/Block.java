@@ -1362,6 +1362,10 @@ public class Block {
 			// Create repository savepoint here so we can rollback to it after testing transactions
 			repository.setSavepoint();
 
+			// Set current block context so GROUP_APPROVAL can resolve same-block pending transactions
+			// (they are not in the repository yet during validation)
+			BlockValidationContext.set(this.getTransactions().stream().map(Transaction::getTransactionData).collect(Collectors.toList()));
+
 			if (!isTestnet) {
 				if (this.blockData.getHeight() == 212937) {
 					// Apply fix for block 212937 but fix will be rolled back before we exit method
@@ -1447,6 +1451,8 @@ public class Block {
 			LOGGER.info("DataException during transaction validation", e);
 			return ValidationResult.TRANSACTION_INVALID;
 		} finally {
+			// Always clear block validation context so ThreadLocal is never left set
+			BlockValidationContext.clear();
 			// Rollback repository changes made by test-processing transactions above
 			try {
 				this.repository.rollbackToSavepoint();
@@ -2574,9 +2580,9 @@ public class Block {
 						.map(GroupAdminData::getAdmin)
 						.collect(Collectors.toList());
 
-				LOGGER.info("Removing NULL Account Address, Dev Admin Count = {}", devAdminAddresses.size());
+				LOGGER.debug("Removing NULL Account Address, Dev Admin Count = {}", devAdminAddresses.size());
 				devAdminAddresses.removeIf( address -> Group.NULL_OWNER_ADDRESS.equals(address) );
-				LOGGER.info("Removed NULL Account Address, Dev Admin Count = {}", devAdminAddresses.size());
+				LOGGER.debug("Removed NULL Account Address, Dev Admin Count = {}", devAdminAddresses.size());
 
 				BlockRewardDistributor devAdminDistributor
 					= (distributionAmount, balanceChanges) -> distributeToAccounts(distributionAmount, devAdminAddresses, balanceChanges);

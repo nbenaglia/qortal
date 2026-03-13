@@ -79,8 +79,9 @@ public class ChannelWriteTask implements Task {
                 return;
             }
 
-            LOGGER.warn("[{}] Network thread {} encountered I/O error: {}", peer.getPeerConnectionId(),
-                    Thread.currentThread().getId(), e.getMessage(), e);
+            String networkLabel = (peer.getPeerType() == Peer.NETWORKDATA) ? "NetworkData" : "Network";
+            LOGGER.debug("[{}] {} thread {} encountered I/O error: {} - {}", peer.getPeerConnectionId(),
+                    networkLabel, Thread.currentThread().getId(), e.getMessage(), peer, e);
             peer.disconnect("I/O error");
         }
     }

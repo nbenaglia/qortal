@@ -42,7 +42,7 @@ public class BlockChain {
 
 	// Properties
 
-	private final boolean isTestChain = false;
+	private boolean isTestChain = false;
 
 	/** Transaction expiry period, starting from transaction's timestamp, in milliseconds. */
 	private long transactionExpiryPeriod;

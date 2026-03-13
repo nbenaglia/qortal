@@ -423,6 +423,7 @@ public class ArbitraryTransaction extends Transaction {
 				return;
 			}
 		}
+		arbitraryResourceData.latestSignature = latestTransactionData.getSignature();
 		ArbitraryResourceData existingArbitraryResourceData = resourceByWrapper.get(wrapper);
 
 		if( existingArbitraryResourceData == null ) {
@@ -510,6 +511,7 @@ public class ArbitraryTransaction extends Transaction {
 		arbitraryResourceData.service = service;
 		arbitraryResourceData.name = name;
 		arbitraryResourceData.identifier = identifier;
+		arbitraryResourceData.latestSignature = arbitraryTransactionData.getSignature();
 
 		// Update status
 		ArbitraryDataResource resource = new ArbitraryDataResource(name, ArbitraryDataFile.ResourceIdType.NAME, service, identifier);
