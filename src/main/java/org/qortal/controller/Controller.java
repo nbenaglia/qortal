@@ -42,6 +42,7 @@ import org.qortal.repository.*;
 import org.qortal.repository.hsqldb.HSQLDBCacheUtils;
 import org.qortal.repository.hsqldb.HSQLDBRepositoryFactory;
 import org.qortal.settings.Settings;
+import org.qortal.transaction.ChatTransaction;
 import org.qortal.transaction.Transaction;
 import org.qortal.transaction.Transaction.TransactionType;
 import org.qortal.transform.TransformationException;
@@ -1132,10 +1133,25 @@ public class Controller extends Thread {
 			if (repository == null)
 				return;
 
-			List<TransactionData> transactions = repository.getTransactionRepository().getUnconfirmedTransactions();
+			// Most unconfirmed tx types expire using the chain-wide transaction expiry period.
+			// PRESENCE has shorter custom lifetimes, so handle it separately to avoid scanning lots
+			// of non-presence tx too early.
+			long standardExpiry = BlockChain.getInstance().getTransactionExpiryPeriod();
+			if (standardExpiry <= 0)
+				standardExpiry = 1;
+
+			long standardCandidatesBefore = now - standardExpiry;
+			List<TransactionData> transactions = repository.getTransactionRepository().getUnconfirmedTransactionsCreatedBefore(standardCandidatesBefore);
+			List<TransactionData> presenceTransactions = repository.getTransactionRepository().getUnconfirmedTransactions(TransactionType.PRESENCE, null);
+
+			Map<String, TransactionData> candidatesBySignature58 = new LinkedHashMap<>();
+			for (TransactionData transactionData : transactions)
+				candidatesBySignature58.put(Base58.encode(transactionData.getSignature()), transactionData);
+			for (TransactionData transactionData : presenceTransactions)
+				candidatesBySignature58.put(Base58.encode(transactionData.getSignature()), transactionData);
 
 			int deletedCount = 0;
-			for (TransactionData transactionData : transactions) {
+			for (TransactionData transactionData : candidatesBySignature58.values()) {
 				Transaction transaction = Transaction.fromData(repository, transactionData);
 
 				if (now >= transaction.getDeadline()) {
@@ -1492,6 +1508,11 @@ public class Controller extends Thread {
 			// If this is an ARBITRARY transaction, we may need to update the cache
 			if (transactionData.getType() == TransactionType.ARBITRARY) {
 				ArbitraryDataManager.getInstance().onExpiredArbitraryTransaction((ArbitraryTransactionData)transactionData);
+			}
+
+			// If this is a CHAT transaction, evict its timestamp from the rate-limit cache
+			if (transactionData.getType() == TransactionType.CHAT) {
+				ChatTransaction.removeExpiredChatTimestamp(transactionData.getCreatorPublicKey(), transactionData.getTimestamp());
 			}
 		});
 	}
