@@ -217,12 +217,12 @@ public class Settings {
 	private int minBlockchainPeers = 3;
 	/** Target number of outbound connections to peers we should make (IP + Reticulum). */
 	private int minOutboundPeers = 16;
-  /** Target number of outbound connections to IP peers we should make. */
-  private int ipMinOutboundPeers = 32;
+	/** Target number of outbound connections to IP peers we should make. */
+	private int ipMinOutboundPeers = 32;
 	/** Maximum number of peer connections we allow. */
 	private int maxPeers = 55;
-  /** Maximum number of IP peer connections we allow. */
-  private int ipMaxPeers = 32;
+	/** Maximum number of IP peer connections we allow. */
+	private int ipMaxPeers = 32;
 	/** Number of slots to reserve for short-lived QDN data transfers */
 	private int maxDataPeers = 64;
 	/** Maximum number of threads for network engine. */
@@ -685,20 +685,20 @@ public class Settings {
 
 	// Related to mesh networking
 
-    public enum NetworkType {
-        IP,
-        RETICULUM;
-    }
+	public enum NetworkType {
+	    IP,
+	    RETICULUM;
+	}
 	/** Preferred network (from above, one of "IP","RETICULUM") */
 	private String preferredNetwork = NetworkType.RETICULUM.name();
 	/** Maximum number of Reticulum peers allowed. */
 	private int reticulumMaxPeers = 55;
-    /** Minimum number of outgoing peers desired */
-    private int reticulumMinOutboundPeers = 13;
+	/** Minimum number of outgoing peers desired */
+	private int reticulumMinOutboundPeers = 13;
 	/** Minimum number of Reticulum Core peers desired. */
 	private int reticulumMinDesiredCorePeers = 5;
-    /** Minimum number of Reticulum Data peers desired. */
-    private int reticulumMinDesiredDataPeers = 8;
+	/** Minimum number of Reticulum Data peers desired. */
+	private int reticulumMinDesiredDataPeers = 8;
 	/** Maximum number of task executor network threads */
 	private int reticulumMaxNetworkThreadPoolSize = 20;
 	/** Node provides a TCPServerInterface or other "qortal"/"qortaltest" gateway interface */
