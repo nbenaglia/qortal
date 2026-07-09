@@ -151,6 +151,11 @@ public class Settings {
 	/* How many blocks to cache locally. Defaulted to 10, which covers a typical Synchronizer request + a few spare - increased to 100 */
 	private int blockCacheSize = 100;
 
+	/** HSQLDB cache_rows: max rows kept in memory (default 50000). */
+	private int hsqldbCacheRows = 50000;
+	/** HSQLDB cache_size: max size of data cache in KB (default 65536 = 64MB). */
+	private int hsqldbCacheSize = 65536;
+
 	/** Maximum number of transactions for the block minter to include in a block */
 	private int maxTransactionsPerBlock = 100;
 
@@ -1061,6 +1066,14 @@ public class Settings {
 
 	public int getBlockCacheSize() {
 		return this.blockCacheSize;
+	}
+
+	public int getHsqldbCacheRows() {
+		return this.hsqldbCacheRows;
+	}
+
+	public int getHsqldbCacheSize() {
+		return this.hsqldbCacheSize;
 	}
 
 	public int getMaxTransactionsPerBlock() {
