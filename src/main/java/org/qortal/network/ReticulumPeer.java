@@ -481,6 +481,25 @@ public class ReticulumPeer implements Peer {
             makePeerUnavailable();
         }
         this.isPeerAvailable = false;
+        // Close the underlying Link so its watchdog thread can exit. Previously teardown()
+        // was left commented out to avoid the ABBA deadlock, which meant dead peers' Links
+        // stayed ACTIVE with a live watchdog forever (test-14: thousands leaked → heap OOM).
+        closePeerLinkNonBlocking();
+    }
+
+    /**
+     * Closes this peer's Link without the blocking, synchronized {@link Link#teardown()} (which
+     * sends a LINKCLOSE packet under the Link monitor and can deadlock with the Reticulum receive
+     * thread — the ABBA lock inversion removed elsewhere in this class). Setting the status is a
+     * plain volatile write with no lock: the Link's watchdog thread exits on its next wake, and
+     * Transport's jobs loop then drops the CLOSED link from activeLinks/pendingLinks so it becomes
+     * GC-eligible. This stops the watchdog-thread / Link-object accumulation seen in test-14.
+     */
+    public void closePeerLinkNonBlocking() {
+        var link = this.peerLink;
+        if (nonNull(link) && link.getStatus() != CLOSED) {
+            link.setStatus(CLOSED);
+        }
     }
 
     public void shutdown() {
@@ -490,6 +509,9 @@ public class ReticulumPeer implements Peer {
                 disconnect("shutting down");
             } else {
                 log.info("shutdown - status (non-ACTIVE): {}", peerLink.getStatus());
+                // Even non-ACTIVE (PENDING/HANDSHAKE/STALE) links have a live watchdog thread —
+                // close them too so every watchdog exits and the JVM can stop cleanly.
+                closePeerLinkNonBlocking();
             }
         }
         this.deleteMe = true;
@@ -831,9 +853,17 @@ public class ReticulumPeer implements Peer {
             var data = concatArrays("close::".getBytes(UTF_8), baseDestination.getHash());
             Packet closePacket = new Packet(link, data);
             var packetReceipt = closePacket.send();
-            packetReceipt.setDeliveryCallback(this::closePacketDelivered);
-            packetReceipt.setTimeout(1000L);
-            packetReceipt.setTimeoutCallback(this::packetTimedOut);
+            // send() returns null when no interface can process the packet — common during
+            // shutdown, when interfaces are already being torn down. Guard against it so the
+            // shutdown sequence isn't aborted by an NPE (which left non-daemon threads alive
+            // and prevented a clean stop in Qortal test-14).
+            if (nonNull(packetReceipt)) {
+                packetReceipt.setDeliveryCallback(this::closePacketDelivered);
+                packetReceipt.setTimeout(1000L);
+                packetReceipt.setTimeoutCallback(this::packetTimedOut);
+            } else {
+                log.debug("close packet could not be sent (no interface available) for {}", this);
+            }
         } else {
             log.debug("can't send to null link");
         }

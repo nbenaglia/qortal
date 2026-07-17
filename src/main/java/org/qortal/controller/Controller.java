@@ -735,8 +735,12 @@ public class Controller extends Thread {
 						// Wait 10 seconds before restart
 						TimeUnit.SECONDS.sleep(10);
 
-						// Start new block minter thread
+						// Start new block minter thread.
+						// A Thread can only be started once, so we must create a fresh
+						// BlockMinter instance here — calling start() on the old (terminated)
+						// one throws IllegalThreadStateException (seen in Qortal test-14).
 						LOGGER.info("Restarting block minter");
+						blockMinter = new BlockMinter();
 						blockMinter.start();
 					} catch (InterruptedException e) {
 						// Couldn't start new block minter thread
