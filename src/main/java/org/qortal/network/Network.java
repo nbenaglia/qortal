@@ -394,17 +394,32 @@ public class Network {
         this.schedulerThread.setDaemon(false);
         this.schedulerThread.start();
 
-        // Completed Setup for Network. Time to launch Reticulum mesh
-        LOGGER.info("Starting Reticulum");
-        RNS.getInstance().start();
-
-        // Completed Setup for Network, Time to launch NetworkData for non-priority tasks
+        // Start the second IP network (QDN) next. IP networking (chain + QDN) must NEVER depend
+        // on the Reticulum mesh, so bring QDN up before launching Reticulum. Previously QDN was
+        // started after RNS.getInstance().start(), so a slow/blocking mesh init stalled QDN
+        // startup — QDN peers stayed at 0 while the mesh failed to form (test-16 wadin).
         LOGGER.info("Starting second network (QDN) on port {}", Settings.getInstance().getQDNListenPort());
         try {
             NetworkData.getInstance().start();
         } catch (IOException | DataException e) {
             LOGGER.error("Unable to start second network for data (QDN)", e);
         }
+
+        // Launch the Reticulum mesh on its own daemon thread. Its init (new Reticulum(), interface
+        // connections, initial announces) must never block Network.start() from returning —
+        // otherwise a mesh that is slow or fails to form would stall the rest of
+        // Controller.startup() (synchronizer, block minter, ...). IP peers form independently of
+        // the mesh; consumers of RNS already guard on RNS.isMeshStarted().
+        LOGGER.info("Starting Reticulum (async)");
+        Thread rnsStartThread = new Thread(() -> {
+            try {
+                RNS.getInstance().start();
+            } catch (Exception e) {
+                LOGGER.error("Unable to start Reticulum mesh", e);
+            }
+        }, "RNS-Startup");
+        rnsStartThread.setDaemon(true);
+        rnsStartThread.start();
     }
 
     // Getters / setters
@@ -1099,6 +1114,21 @@ public class Network {
                         }
                     } catch (CancelledKeyException e) {
                         // key was cancelled between isValid() and isReadable/isWritable
+                    } catch (RuntimeException e) {
+                        // Defense-in-depth: a bug in per-peer processing (e.g. the null-replyQueues
+                        // NPE in readChannel that killed Network-IO on test-16 wadin) must never take
+                        // down the shared Network-IO thread and with it all chain networking. Log,
+                        // drop just this peer, and keep the loop alive.
+                        Peer peer = (Peer) key.attachment();
+                        LOGGER.warn("Network-IO: unexpected error processing peer {}, disconnecting: {}",
+                                peer != null ? peer.getPeerConnectionId() : "?", e.getMessage(), e);
+                        if (peer != null) {
+                            try {
+                                peer.disconnect("Network-IO error");
+                            } catch (Exception ignored) {
+                                // best-effort cleanup
+                            }
+                        }
                     }
                 }
             }

@@ -251,7 +251,12 @@ public class IPPeer implements Peer {
      */
     @PeerCtor("socket")
     public IPPeer(SocketChannel socketChannel, int network) throws IOException {
-        this.isOutbound = false;
+        // Delegate to the shared constructor to initialize replyQueues/sendQueue/pendingMessages.
+        // This path previously set fields directly and relied on sharedSetup() to create those
+        // queues — but their inits are commented out there, so inbound (accepted) peers had a
+        // null replyQueues. readChannel() then NPE'd on the first received message and killed the
+        // non-daemon Network-IO thread (test-16 wadin: chain network dead ~11.5h, no sync).
+        this(network, false);
         this.socketChannel = socketChannel;
         int port = socketChannel.socket().getPort();
 

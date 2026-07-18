@@ -945,6 +945,20 @@ public class NetworkData {
                             setInterestOps(serverSelectionKey.channel(), SelectionKey.OP_ACCEPT);
                         }
                     } catch (CancelledKeyException e) {
+                    } catch (RuntimeException e) {
+                        // Defense-in-depth (mirrors Network.runIOLoop): a bug in per-peer
+                        // processing must never kill the shared NetworkData-IO thread and take
+                        // down all QDN networking. Log, drop just this peer, keep the loop alive.
+                        Peer peer = (Peer) key.attachment();
+                        LOGGER.warn("NetworkData-IO: unexpected error processing peer {}, disconnecting: {}",
+                                peer != null ? peer.getPeerConnectionId() : "?", e.getMessage(), e);
+                        if (peer != null) {
+                            try {
+                                peer.disconnect("NetworkData-IO error");
+                            } catch (Exception ignored) {
+                                // best-effort cleanup
+                            }
+                        }
                     }
                 }
             }
