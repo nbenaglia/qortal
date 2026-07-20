@@ -82,6 +82,21 @@ public class Network {
      * Maximum time allowed for handshake to complete, in milliseconds.
      */
     private static final long HANDSHAKE_TIMEOUT = 60 * 1000L; // ms
+    /**
+     * Time budget for acquiring a repository connection to persist known peers during shutdown.
+     * Kept well inside stop.sh's 120s force-kill so a stalled pool cannot cost us a clean stop.
+     */
+    private static final long SHUTDOWN_REPOSITORY_TIMEOUT_MS = 10 * 1000L; // ms
+    /**
+     * Time budget for the UPnP port release during shutdown, which does blocking SSDP discovery.
+     */
+    private static final long SHUTDOWN_UPNP_TIMEOUT_MS = 5 * 1000L; // ms
+    /**
+     * Bounds on how long the scheduler loop sleeps when it finds no task due. See
+     * {@link #idleSleepMillis}.
+     */
+    private static final long MIN_IDLE_SLEEP = 25L; // ms
+    private static final long MAX_IDLE_SLEEP = 250L; // ms
 
     private static final byte[] MAINNET_MESSAGE_MAGIC = new byte[]{0x51, 0x4f, 0x52, 0x54}; // QORT
     // Magic for devnet. Only use for testing and development.
@@ -1202,7 +1217,7 @@ public class Network {
                         LOGGER.debug("Worker pool rejected scheduler task (pool full or shutting down)");
                     }
                 } else {
-                    Thread.sleep(10);
+                    Thread.sleep(idleSleepMillis(now));
                 }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
@@ -1210,6 +1225,33 @@ public class Network {
             }
         }
         LOGGER.debug("Network scheduler loop exiting");
+    }
+
+    /**
+     * How long to sleep when no task was due, derived from the nearest deadline the scheduler
+     * actually knows about (next connect, next broadcast) and clamped to
+     * [{@value #MIN_IDLE_SLEEP}, {@value #MAX_IDLE_SLEEP}] ms.
+     * <p>
+     * This loop used to sleep a flat 10ms, i.e. ~100 wakeups/sec forever, each one re-streaming
+     * the handshaked and connected peer lists in {@link #maybeProducePeerPingTask}. Nothing here
+     * runs anywhere near that often — pings are every 40s, broadcasts every 30s, and the connect
+     * task reschedules at +1s — so almost every wakeup was wasted work. The cost is a fixed
+     * wakeup rate, so it lands as a fixed share of one core and hurts in inverse proportion to
+     * CPU speed: ~7% on a fast dev box, but 60%+ on the 2-4 core nodes some testers run.
+     * <p>
+     * The upper clamp matters as much as the lower one: peer ping deadlines are not tracked here,
+     * and peers can be added or timestamps moved by other threads while we sleep, so capping the
+     * sleep bounds how stale our view can get. At {@value #MAX_IDLE_SLEEP}ms that staleness is
+     * negligible against a 40s ping interval, while cutting idle wakeups by up to 25x.
+     */
+    private long idleSleepMillis(Long now) {
+        if (now == null)
+            return MIN_IDLE_SLEEP;
+
+        long nearestDeadline = Math.min(nextConnectTaskTimestamp.get(), nextBroadcastTimestamp.get());
+        long untilDue = nearestDeadline - now;
+
+        return Math.max(MIN_IDLE_SLEEP, Math.min(MAX_IDLE_SLEEP, untilDue));
     }
 
     /** Produces one Ping, Connect, or Broadcast task if due; otherwise null. */
@@ -1262,7 +1304,13 @@ public class Network {
                         properlyConnectedFixedPeers++;
                 }
             }
+            // These "we already have enough peers" exits must advance nextConnectTaskTimestamp
+            // like the normal path below. Returning without it left the deadline permanently in
+            // the past on a well-connected fixed-network node, so the scheduler re-ran this whole
+            // scan — including the nested fixedNetwork.anyMatch over every handshaked peer — on
+            // every single loop iteration, and idleSleepMillis() could never sleep past its floor.
             if (properlyConnectedFixedPeers >= fixedNetwork.size() && getImmutableOutboundHandshakedPeers().size() >= minOutboundPeers) {
+                nextConnectTaskTimestamp.set(now + 1000L);
                 return null;
             }
 
@@ -1272,6 +1320,7 @@ public class Network {
                     .filter(peer -> peer.getHandshakeStatus() == Handshake.COMPLETED)
                     .collect(Collectors.toList());
             if (iOHP.size() >= minOutboundPeers) {
+                nextConnectTaskTimestamp.set(now + 1000L);
                 return null;
             }
         }
@@ -3054,7 +3103,37 @@ public class Network {
 
     // Shutdown
 
-    public void shutdown() {
+    /**
+     * Polls {@link RepositoryManager#tryRepository()} until it yields a connection or the budget
+     * expires, returning null on timeout. Used in place of the blocking
+     * {@link RepositoryManager#getRepository()} on the shutdown path, which has no timeout and
+     * waits forever on an exhausted connection pool.
+     */
+    private static Repository tryRepositoryWithin(long timeoutMs) throws DataException {
+        final long deadline = System.currentTimeMillis() + timeoutMs;
+        while (true) {
+            Repository repository = RepositoryManager.tryRepository();
+            if (repository != null)
+                return repository;
+
+            if (System.currentTimeMillis() >= deadline)
+                return null;
+
+            try {
+                Thread.sleep(100);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return null;
+            }
+        }
+    }
+
+    /**
+     * Stops accepting new inbound connections, without any of the slow teardown work in
+     * {@link #shutdown()}. Idempotent, non-blocking, and safe to call ahead of shutdown() so that
+     * this network stops taking on new peers even if some later teardown step stalls.
+     */
+    public void stopAcceptingConnections() {
         this.isShuttingDown = true;
 
         // Close listen socket to prevent more incoming connections
@@ -3065,6 +3144,10 @@ public class Network {
                 // Not important
             }
         }
+    }
+
+    public void shutdown() {
+        stopAcceptingConnections();
 
         // Stop I/O and scheduler threads
         if (this.ioThread != null && this.ioThread.isAlive()) {
@@ -3100,42 +3183,68 @@ public class Network {
             this.networkWorkerPool.shutdownNow();
         }
 
-        try( Repository repository = RepositoryManager.getRepository() ){
+        // Persist known peers on a bounded acquisition. RepositoryManager.getRepository() blocks
+        // forever if the HSQLDB pool is exhausted, and this whole method runs before
+        // NetworkData.shutdown() — so a stall here left the QDN listen socket accepting new peers
+        // until stop.sh's 120s force-kill (test-17). Losing the saved peer list only costs us a
+        // re-bootstrap on next start; never returning costs us a clean shutdown.
+        try( Repository repository = tryRepositoryWithin(SHUTDOWN_REPOSITORY_TIMEOUT_MS) ){
+            if (repository == null) {
+                LOGGER.warn("Could not acquire repository connection within {}ms - skipping known-peer save",
+                        SHUTDOWN_REPOSITORY_TIMEOUT_MS);
+            } else {
+                // reset all known peers in database
+                int deletedCount = repository.getNetworkRepository().deleteAllPeers();
 
-            // reset all known peers in database
-            int deletedCount = repository.getNetworkRepository().deleteAllPeers();
+                LOGGER.debug("Deleted {} known peers", deletedCount);
 
-            LOGGER.debug("Deleted {} known peers", deletedCount);
-
-            List<PeerData> knownPeersToProcess;
-            synchronized (this.allKnownPeers) {
-                knownPeersToProcess = new ArrayList<>(this.allKnownPeers);
-            }
-
-            int addedPeerCount = 0;
-
-            // save all known peers for next start up
-            for (PeerData knownPeerToProcess : knownPeersToProcess) {
-                if (knownPeerToProcess.getPeerMetaType() == PeerMetaType.RETICULUM) {
-                    // don't save any ReticulumPeer
-                    continue;
+                List<PeerData> knownPeersToProcess;
+                synchronized (this.allKnownPeers) {
+                    knownPeersToProcess = new ArrayList<>(this.allKnownPeers);
                 }
-                repository.getNetworkRepository().save(knownPeerToProcess);
-                addedPeerCount++;
+
+                int addedPeerCount = 0;
+
+                // save all known peers for next start up
+                for (PeerData knownPeerToProcess : knownPeersToProcess) {
+                    if (knownPeerToProcess.getPeerMetaType() == PeerMetaType.RETICULUM) {
+                        // don't save any ReticulumPeer
+                        continue;
+                    }
+                    repository.getNetworkRepository().save(knownPeerToProcess);
+                    addedPeerCount++;
+                }
+
+                repository.saveChanges();
+
+                LOGGER.debug("Added {} known peers", addedPeerCount);
             }
-
-            repository.saveChanges();
-
-            LOGGER.debug("Added {} known peers", addedPeerCount);
         } catch (DataException e) {
             LOGGER.error(e.getMessage(), e);
         }
 
-        // Release uPnP if it was enabled
-        try {
-            UPnP.closePortTCP(Settings.getInstance().getListenPort());
-        } catch (Exception e) {
-            // do nothing
+        // Release uPnP if it was enabled. Guarded by isUPnPEnabled() to match start() — without it
+        // a node with UPnP turned off still paid for gateway discovery here. Run on a throwaway
+        // daemon thread with a timeout: the library call does blocking SSDP discovery and offers no
+        // timeout of its own, so on an unresponsive gateway it can stall shutdown indefinitely.
+        if (Settings.getInstance().isUPnPEnabled()) {
+            Thread upnpCloser = new Thread(() -> {
+                try {
+                    UPnP.closePortTCP(Settings.getInstance().getListenPort());
+                } catch (Exception e) {
+                    // do nothing
+                }
+            }, "UPnP-Close");
+            upnpCloser.setDaemon(true);
+            upnpCloser.start();
+            try {
+                upnpCloser.join(SHUTDOWN_UPNP_TIMEOUT_MS);
+                if (upnpCloser.isAlive())
+                    LOGGER.warn("UPnP port release did not complete within {}ms - continuing shutdown",
+                            SHUTDOWN_UPNP_TIMEOUT_MS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
         }
         // Close all peer connections
         for (Peer peer : this.getImmutableConnectedPeers()) {

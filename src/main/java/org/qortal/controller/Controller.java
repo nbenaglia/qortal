@@ -1360,6 +1360,12 @@ public class Controller extends Thread {
                 RNS.getInstance().shutdown();
 
 				LOGGER.info("Shutting down networking");
+				// Close BOTH listen sockets before either teardown starts. These calls are
+				// non-blocking; the shutdown() calls below are not. In test-17 Network.shutdown()
+				// stalled, so NetworkData.shutdown() was never reached and the QDN socket kept
+				// completing handshakes for the full 120s until stop.sh force-killed the node.
+				Network.getInstance().stopAcceptingConnections();
+				NetworkData.getInstance().stopAcceptingConnections();
 				Network.getInstance().shutdown();
 				NetworkData.getInstance().shutdown();
 				PeerSendManagement.getInstance().shutdown();

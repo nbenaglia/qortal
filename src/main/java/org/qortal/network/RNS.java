@@ -1727,6 +1727,10 @@ public class RNS {
 
     public void removeLinkedPeer(ReticulumPeer peer) {
         peer.shutdownChannel(); // clears channel + nulls peerBuffer; no close() to avoid deadlock
+        // NOTE: deliberately does NOT close peerLink. Callers that remove an ACTIVE link must close
+        // it themselves, passing the exact Link they decided on (see prunePeers) — closing here
+        // would both re-read a peerLink that initPeerLink() may have re-pointed at a fresh Link,
+        // and close PENDING links, which triggers the expirePath() cull cascade documented below.
         this.linkedPeers.remove(peer); // single synchronized operation on the list
         this.immutableLinkedPeers = List.copyOf(this.linkedPeers);
         //var network = Network.getInstance();
@@ -1764,6 +1768,11 @@ public class RNS {
                                 newAspect, encodeHexString(newHash));
                         it.remove();
                         existing.shutdownChannel();
+                        // The superseded peer always holds a different Link object than the
+                        // replacement (both baseClientConnected and dataClientConnected build a
+                        // fresh ReticulumPeer per incoming Link), so closing it cannot disturb the
+                        // new peer. Without this its watchdog thread leaks (see removeLinkedPeer).
+                        closeIfActive(existing);
                     }
                 }
             }
@@ -1772,8 +1781,31 @@ public class RNS {
         }
     }
 
+    /**
+     * Closes a discarded peer's Link if — and only if — it is still ACTIVE, so its watchdog thread
+     * can exit. Plain volatile write, no lock, so it cannot deadlock with the Reticulum receive
+     * thread (the ABBA inversion avoided elsewhere in this class).
+     * <p>
+     * ACTIVE-only is deliberate. A PENDING link closed here would be picked up by Transport's
+     * jobs() loop as a CLOSED entry in pendingLinks, which calls expirePath() and resets
+     * tablesLastCulled — cascading routing-table culls that hold the Transport lock for minutes.
+     * PENDING, HANDSHAKE and STALE watchdogs all reach CLOSED on their own via the establishment
+     * or stale timeout, so they never leak; only ACTIVE orphans do.
+     */
+    private void closeIfActive(ReticulumPeer peer) {
+        var link = peer.getPeerLink();
+        if (nonNull(link) && link.getStatus() == ACTIVE) {
+            link.setStatus(CLOSED);
+        }
+    }
+
     public void removeIncomingPeer(ReticulumPeer peer) {
         peer.shutdownChannel(); // clears channel + nulls peerBuffer; no close() to avoid deadlock
+        // A stale-but-still-ACTIVE incoming link is kept alive indefinitely by the remote
+        // initiator's keepalives, so its watchdog thread never exits — close it. Incoming peers are
+        // built fresh per Link (baseClientConnected/dataClientConnected) and never re-initiated, so
+        // reading peerLink here cannot pick up a replacement. Only ACTIVE: see removeLinkedPeer.
+        closeIfActive(peer);
         this.incomingPeers.remove(peer); // single synchronized operation on the list
         this.immutableIncomingPeers = List.copyOf(this.incomingPeers);
     }
@@ -1873,6 +1905,14 @@ public class RNS {
                                 p.getDeleteMe() ? "deleteMe" : "data timeout",
                                 encodeHexString(p.getDestinationHash()));
                         p.makePeerUnavailable();
+                        // Close this exact Link — not p.getPeerLink(), which initPeerLink() may
+                        // already have re-pointed at a fresh Link. An orphaned ACTIVE Link never
+                        // dies on its own: its watchdog sends keepalives, the remote answers,
+                        // lastInbound advances, so the staleTime check never fires and the status
+                        // never reaches CLOSED. Test-17 wadin leaked 16,642 watchdog threads this
+                        // way over 2 days (~340/h, RSS 34.8G) before crashing. Safe to close here
+                        // because the link is ACTIVE, not PENDING — no expirePath() cull cascade.
+                        pLink.setStatus(CLOSED);
                         removeLinkedPeer(p);
                     }
                     continue;

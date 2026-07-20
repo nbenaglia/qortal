@@ -2619,8 +2619,12 @@ public class NetworkData {
         }
     }
 
-    // Shutdown
-    public void shutdown() {
+    /**
+     * Stops accepting new inbound QDN connections, without any of the slow teardown work in
+     * {@link #shutdown()}. Idempotent, non-blocking, and safe to call ahead of shutdown() so the
+     * QDN listen socket closes even if Network's teardown stalls before we get here.
+     */
+    public void stopAcceptingConnections() {
         this.isShuttingDown = true;
 
         // Close listen socket to prevent more incoming connections
@@ -2631,6 +2635,11 @@ public class NetworkData {
                 // Not important
             }
         }
+    }
+
+    // Shutdown
+    public void shutdown() {
+        stopAcceptingConnections();
 
         // Shutdown chunk processor pool first (stop accepting new chunk processing tasks)
         LOGGER.info("Shutting down chunk processor pool...");
