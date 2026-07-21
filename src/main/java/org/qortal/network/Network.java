@@ -1324,6 +1324,26 @@ public class Network {
                 return null;
             }
         }
+        // Steady-state fast path: if we already have our target of outbound IP peers, skip the
+        // getConnectablePeer() scan entirely. That scan runs on THIS (scheduler) thread once per
+        // second and is O(allKnownPeers) — several removeIf passes, one with a per-element inner
+        // stream over connected peers, plus getAllKnownPeers()'s distinct() — so on a long-lived
+        // node with a large known-peer table it comes to dominate scheduler CPU (test-18:
+        // Network-Scheduler ramped to 80%+ on node5/wadin over 1-2h as the peer table grew).
+        // connectPeer() already enforces this exact ceiling, but only after the scan has been paid
+        // for on a worker thread and then discards the picked peer — so at target the scan is pure
+        // waste. Fixed-network peering is intentionally excluded: the block above may need to
+        // reconnect a wrongly-directed fixed peer even when the outbound count is already met.
+        if (!hasFixedNetwork) {
+            long outboundIPCount = getImmutableOutboundHandshakedPeers().stream()
+                    .filter(peer -> peer.getPeerMetaType() == PeerMetaType.IP)
+                    .count();
+            if (outboundIPCount >= minOutboundPeers) {
+                nextConnectTaskTimestamp.set(now + 1000L);
+                return null;
+            }
+        }
+
         boolean hasNoPeers = getImmutableHandshakedPeers().isEmpty();
         if (hasNoPeers && lastPeerWasFromBackoff) {
             nextConnectTaskTimestamp.set(now + ISOLATION_RETRY_INTERVAL);
