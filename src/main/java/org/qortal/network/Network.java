@@ -41,7 +41,6 @@ import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
-import java.util.stream.Stream;
 
 import org.qortal.network.RNSCommon.PeerMetaType;
 import static io.reticulum.link.LinkStatus.ACTIVE;
@@ -137,7 +136,20 @@ public class Network {
     private long nextDisconnectionCheck = 0L;
 
     private final List<PeerData> allKnownPeers = new ArrayList<>();
-    
+
+    /**
+     * Cache backing {@link #buildPeersMessage} — the advertised PEERS_V2 address list, rebuilt at
+     * most every {@link #PEERS_MESSAGE_CACHE_TTL}. Two variants: {@code local} includes local/LAN
+     * addresses (only sent to local peers), {@code remote} omits them. Rebuilding is the expensive
+     * part (known-peer snapshot + a blocking DNS lookup per peer); caching keeps it off the
+     * per-request path that was the hottest compiled code and the recurring SIGSEGV site on wadin.
+     */
+    private static final long PEERS_MESSAGE_CACHE_TTL = 60 * 1000L; // ms
+    private final Object peersMessageCacheLock = new Object();
+    private volatile List<PeerAddress> cachedPeerAddressesLocal = null;
+    private volatile List<PeerAddress> cachedPeerAddressesRemote = null;
+    private volatile long cachedPeerAddressesTimestamp = 0L;
+
     /**
      * Track whether the last peer selected was from the backoff list.
      * Used to determine retry interval when isolated.
@@ -765,12 +777,18 @@ public class Network {
     // Peer lists
 
     public List<PeerData> getAllKnownPeers() {
+        // Snapshot the IP known-peer list under its lock, then append Reticulum peers OUTSIDE the
+        // lock. Previously the RNS call ran while holding the allKnownPeers monitor, and the whole
+        // thing was piped through .distinct() — but PeerData has no Object.equals override, so
+        // distinct() only de-duplicated by object identity (a no-op here) at O(n) cost. Dropping it
+        // and releasing the lock before the RNS call cuts contention on this hot path (see the
+        // test-19 buildPeersMessage crash analysis).
+        List<PeerData> peers;
         synchronized (this.allKnownPeers) {
-            //return new ArrayList<>(this.allKnownPeers);
-            return Stream.concat(this.allKnownPeers.stream(), RNS.getInstance().getAllKnownPeers().stream())
-                    .distinct()
-                    .collect(Collectors.toList());
+            peers = new ArrayList<>(this.allKnownPeers);
         }
+        peers.addAll(RNS.getInstance().getAllKnownPeers());
+        return peers;
     }
 
     public List<Peer> getImmutableConnectedPeers() {
@@ -2561,50 +2579,75 @@ public class Network {
      * Returns PEERS message made from peers we've connected to recently, and this node's details
      */
     public Message buildPeersMessage(Peer peer) {
+        // Serve the address list from a periodically-rebuilt cache. Building it used to run on
+        // every GetPeers request (on Network-Worker threads): a full known-peer snapshot plus a
+        // blocking InetAddress.getByName() per peer to classify local addresses. Over wadin's very
+        // large table that made this the hottest compiled path and the recurring SIGSEGV site
+        // (test-17, test-19). The PeersV2Message constructor just serialises the (small, precomputed)
+        // list, so building it per call is cheap; only the address list is cached.
+        return new PeersV2Message(getCachedPeerAddresses(peer.isLocal()));
+    }
+
+    /**
+     * Returns the cached list of peer addresses to advertise, rebuilding it if older than
+     * {@link #PEERS_MESSAGE_CACHE_TTL}. {@code forLocalPeer} selects the variant that still
+     * includes local/LAN addresses; remote peers get the variant with those removed.
+     */
+    private List<PeerAddress> getCachedPeerAddresses(boolean forLocalPeer) {
+        if (this.cachedPeerAddressesRemote == null
+                || System.currentTimeMillis() - this.cachedPeerAddressesTimestamp > PEERS_MESSAGE_CACHE_TTL) {
+            synchronized (this.peersMessageCacheLock) {
+                // Re-check under the lock so only one thread rebuilds per interval.
+                if (this.cachedPeerAddressesRemote == null
+                        || System.currentTimeMillis() - this.cachedPeerAddressesTimestamp > PEERS_MESSAGE_CACHE_TTL) {
+                    rebuildPeerAddressCache();
+                }
+            }
+        }
+        return forLocalPeer ? this.cachedPeerAddressesLocal : this.cachedPeerAddressesRemote;
+    }
+
+    private void rebuildPeerAddressCache() {
         List<PeerData> knownPeers = this.getAllKnownPeers();
 
-        // Filter out peers that we've not connected to ever or within X milliseconds
-        final long connectionThreshold = NTP.getTime() - RECENT_CONNECTION_THRESHOLD;
-        Predicate<PeerData> notRecentlyConnected = peerData -> {
+        // Filter out peers we've not connected to ever, or not within RECENT_CONNECTION_THRESHOLD.
+        final Long ntpNow = NTP.getTime();
+        final long nowMillis = (ntpNow != null) ? ntpNow : System.currentTimeMillis();
+        final long connectionThreshold = nowMillis - RECENT_CONNECTION_THRESHOLD;
+        knownPeers.removeIf(peerData -> {
             final Long lastAttempted = peerData.getLastAttempted();
             final Long lastConnected = peerData.getLastConnected();
-
             if (lastAttempted == null || lastConnected == null) {
                 return true;
             }
-
             if (lastConnected < lastAttempted) {
                 return true;
             }
-
             if (lastConnected < connectionThreshold) {
                 return true;
             }
-
             return false;
-        };
-        knownPeers.removeIf(notRecentlyConnected);
+        });
 
-        List<PeerAddress> peerAddresses = new ArrayList<>();
-
+        List<PeerAddress> localList = new ArrayList<>();
+        List<PeerAddress> remoteList = new ArrayList<>();
         for (PeerData peerData : knownPeers) {
             try {
                 InetAddress address = InetAddress.getByName(peerData.getAddress().getHost());
-
-                // Don't send 'local' addresses if peer is not 'local'.
-                // e.g. don't send localhost:9084 to node4.qortal.org
-                if (!peer.isLocal() && Peer.isAddressLocal(address)) {
-                    continue;
+                // Local peers may receive every address; remote peers must not be told about
+                // 'local' addresses (e.g. don't send localhost:9084 to node4.qortal.org).
+                localList.add(peerData.getAddress());
+                if (!Peer.isAddressLocal(address)) {
+                    remoteList.add(peerData.getAddress());
                 }
-
-                peerAddresses.add(peerData.getAddress());
             } catch (UnknownHostException e) {
                 // Couldn't resolve hostname to IP address so discard
             }
         }
 
-        // New format PEERS_V2 message that supports hostnames, IPv6 and ports
-        return new PeersV2Message(peerAddresses);
+        this.cachedPeerAddressesLocal = List.copyOf(localList);
+        this.cachedPeerAddressesRemote = List.copyOf(remoteList);
+        this.cachedPeerAddressesTimestamp = System.currentTimeMillis();
     }
 
     /** Builds either (legacy) HeightV2Message or (newer) BlockSummariesV2Message, depending on peer version.
