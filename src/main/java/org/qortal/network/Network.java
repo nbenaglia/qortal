@@ -96,6 +96,15 @@ public class Network {
      */
     private static final long MIN_IDLE_SLEEP = 25L; // ms
     private static final long MAX_IDLE_SLEEP = 250L; // ms
+    /**
+     * How often the scheduler scans the peer lists for a due ping. The scan itself is the cost:
+     * it streams every handshaked and connected peer calling getPingTask(). Previously it ran on
+     * every loop iteration (up to ~40 Hz), so on a node whose peer lists have bloated with stale
+     * Reticulum entries it pinned Network-Scheduler near 100% of a core (test-20 wadin). Pings are
+     * due only every PING_INTERVAL (40s), so 250 ms (4 Hz) keeps them prompt while cutting the scan
+     * rate ~10x; 4 Hz still comfortably covers the max natural ping rate (~maxPeers/40s).
+     */
+    private static final long PING_CHECK_INTERVAL = 250L; // ms
 
     private static final byte[] MAINNET_MESSAGE_MAGIC = new byte[]{0x51, 0x4f, 0x52, 0x54}; // QORT
     // Magic for devnet. Only use for testing and development.
@@ -281,6 +290,8 @@ public class Network {
     private final AtomicLong nextConnectTaskTimestamp = new AtomicLong(0L);
     /** Scheduler state: when to do next broadcast. */
     private final AtomicLong nextBroadcastTimestamp = new AtomicLong(0L);
+    /** Scheduler state: when to next scan peers for a due ping. */
+    private final AtomicLong nextPingCheckTimestamp = new AtomicLong(0L);
 
     private Selector channelSelector;
     private ServerSocketChannel serverChannel;
@@ -1266,7 +1277,8 @@ public class Network {
         if (now == null)
             return MIN_IDLE_SLEEP;
 
-        long nearestDeadline = Math.min(nextConnectTaskTimestamp.get(), nextBroadcastTimestamp.get());
+        long nearestDeadline = Math.min(nextPingCheckTimestamp.get(),
+                Math.min(nextConnectTaskTimestamp.get(), nextBroadcastTimestamp.get()));
         long untilDue = nearestDeadline - now;
 
         return Math.max(MIN_IDLE_SLEEP, Math.min(MAX_IDLE_SLEEP, untilDue));
@@ -1287,6 +1299,14 @@ public class Network {
     }
 
     private ExecuteProduceConsume.Task maybeProducePeerPingTask(Long now) {
+        // Throttle the scan (not just the pings): it streams the whole handshaked + connected peer
+        // lists, which on a churned node bloat with stale Reticulum entries. Running it every loop
+        // iteration was the Network-Scheduler CPU sink on wadin (test-20).
+        if (now == null || now < nextPingCheckTimestamp.get()) {
+            return null;
+        }
+        nextPingCheckTimestamp.set(now + PING_CHECK_INTERVAL);
+
         ExecuteProduceConsume.Task task = getImmutableHandshakedPeers().stream()
                 .map(peer -> peer.getPingTask(now))
                 .filter(Objects::nonNull)

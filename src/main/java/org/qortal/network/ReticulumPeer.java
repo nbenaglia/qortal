@@ -247,7 +247,13 @@ public class ReticulumPeer implements Peer {
         this.replyQueues = new ConcurrentHashMap<>();
         this.pendingMessages = new LinkedBlockingQueue<>();
         this.peerAddress = new ReticulumPeerAddress(dhash);
-        this.peerData = new PeerData(peerAddress,NTP.getTime(),"ReticulumPeer");
+        //this.peerData = new PeerData(peerAddress,NTP.getTime(),"ReticulumPeer");
+        this.peerData = new PeerData(
+          peerAddress,
+          null, null, null,
+          System.currentTimeMillis(),
+          "ReticulumPeer"
+        );
         this.peerData.setPeerMetaType(this.peerMetaType);
 
         Long ntpTime = NTP.getTime();
@@ -282,7 +288,13 @@ public class ReticulumPeer implements Peer {
         this.peerLink.setPacketCallback(this::linkPacketReceived);
 
         this.peerAddress = new ReticulumPeerAddress(this.destinationHash);
-        this.peerData = new PeerData(this.peerAddress, NTP.getTime(),"ReticulumPeer");
+        //this.peerData = new PeerData(this.peerAddress, NTP.getTime(),"ReticulumPeer");
+        this.peerData = new PeerData(
+          this.peerAddress,
+          null, null, null,
+          System.currentTimeMillis(),
+          "ReticulumPeer"
+        );
         this.peerData.setPeerMetaType(this.peerMetaType);
 
         Long ntpTime = NTP.getTime();
