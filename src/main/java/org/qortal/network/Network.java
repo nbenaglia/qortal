@@ -828,8 +828,12 @@ public class Network {
         // ATOMIC: Synchronize to ensure add() and List.copyOf() are atomic
         // Without this, another thread could modify the list between add() and copyOf()
         synchronized (this.connectedPeers) {
-            this.connectedPeers.add(peer);
-            this.immutableConnectedPeers = List.copyOf(this.connectedPeers);
+            // Dedup by identity: makePeerAvailable() (Reticulum) can fire more than once for the
+            // same peer object, and add() does not dedup — without this the object piles up.
+            if (this.connectedPeers.stream().noneMatch(p -> p == peer)) {
+                this.connectedPeers.add(peer);
+                this.immutableConnectedPeers = List.copyOf(this.connectedPeers);
+            }
         }
     }
 
@@ -953,8 +957,11 @@ public class Network {
         // ATOMIC: Synchronize to ensure add() and List.copyOf() are atomic
         // Without this, another thread could modify the list between add() and copyOf()
         synchronized (this.handshakedPeers) {
-            this.handshakedPeers.add(peer);
-            this.immutableHandshakedPeers = List.copyOf(this.handshakedPeers);
+            // Dedup by identity (see addConnectedPeer).
+            if (this.handshakedPeers.stream().noneMatch(p -> p == peer)) {
+                this.handshakedPeers.add(peer);
+                this.immutableHandshakedPeers = List.copyOf(this.handshakedPeers);
+            }
         }
 
         // Also add to outbound handshaked peers cache
@@ -991,8 +998,11 @@ public class Network {
         // ATOMIC: Synchronize to ensure add() and List.copyOf() are atomic
         // Without this, another thread could modify the list between add() and copyOf()
         synchronized (this.outboundHandshakedPeers) {
-            this.outboundHandshakedPeers.add(peer);
-            this.immutableOutboundHandshakedPeers = List.copyOf(this.outboundHandshakedPeers);
+            // Dedup by identity (see addConnectedPeer).
+            if (this.outboundHandshakedPeers.stream().noneMatch(p -> p == peer)) {
+                this.outboundHandshakedPeers.add(peer);
+                this.immutableOutboundHandshakedPeers = List.copyOf(this.outboundHandshakedPeers);
+            }
         }
     }
 

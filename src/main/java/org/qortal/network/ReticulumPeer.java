@@ -160,6 +160,7 @@ public class ReticulumPeer implements Peer {
     private PeerData peerData;
     private PeerCapabilities peerCapabilities;
     private long linkEstablishedTime = -1L; // equivalent of (tcpip) Peer 'handshakeComplete'
+    private volatile boolean isStopping = false;
     // Versioning
     public static final Pattern VERSION_PATTERN = Pattern.compile(Controller.VERSION_PREFIX
             + "(\\d{1,3})\\.(\\d{1,5})\\.(\\d{1,5})");
@@ -1459,7 +1460,9 @@ public class ReticulumPeer implements Peer {
         return this.peersNodeId;
     }
 
-    public boolean isStopping() { return false; }
+    public boolean isStopping() {
+        return this.isStopping;
+    }
 
     public UUID getPeerConnectionId() {
         return this.peerConnectionId;

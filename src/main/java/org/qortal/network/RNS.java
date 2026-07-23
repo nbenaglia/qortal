@@ -1733,10 +1733,15 @@ public class RNS {
         // and close PENDING links, which triggers the expirePath() cull cascade documented below.
         this.linkedPeers.remove(peer); // single synchronized operation on the list
         this.immutableLinkedPeers = List.copyOf(this.linkedPeers);
-        //var network = Network.getInstance();
-        //network.removeHandshakedPeer(peer);
-        //network.removeOutboundHandshakedPeer(peer);
-        //network.removeConnectedPeer(peer);
+        // Remove from Network's connected/handshaked lists on EVERY removal path. This was
+        // previously commented out (and only some callers, e.g. prunePeers, called
+        // makePeerUnavailable() explicitly first) — so removal paths that didn't, like
+        // RNS.removePeer(), leaked the dead peer into Network.handshakedPeers/connectedPeers
+        // forever. Over a churny run that bloated the ping-scan lists and grew Network-Scheduler
+        // CPU without bound (test-20/21 wadin). Idempotent, so a double call with an explicit
+        // makePeerUnavailable() before the call is harmless. No RNS lock is held here, so acquiring
+        // Network's peer-list locks cannot deadlock.
+        peer.makePeerUnavailable();
     }
 
     // note: we already have a lombok getter for this
@@ -1808,6 +1813,9 @@ public class RNS {
         closeIfActive(peer);
         this.incomingPeers.remove(peer); // single synchronized operation on the list
         this.immutableIncomingPeers = List.copyOf(this.incomingPeers);
+        // Incoming BASE peers are also registered in Network's connected/handshaked lists via
+        // makePeerAvailable(); remove them here so they don't leak (see removeLinkedPeer).
+        peer.makePeerUnavailable();
     }
 
     // note: we already have a lombok getter for this
