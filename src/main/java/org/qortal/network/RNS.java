@@ -213,10 +213,13 @@ public class RNS {
      */
     private static final long BROADCAST_INTERVAL = 30 * 1000L; // ms
     /**
-     * Link low-level ping interval and timeout
+     * How long a Link may go with no inbound activity before we treat it as unreachable. Liveness
+     * now comes from the Reticulum Link's native keepalive via its (library-fixed) lastInbound,
+     * which is refreshed on real traffic AND on keepalive round-trips (every ~360s, the library
+     * KEEPALIVE, when idle). Allow ~2x that so an idle-but-alive link riding on keepalives alone is
+     * not culled. Replaces the old app-level ping + 165s lastAccessTimestamp staleness.
      */
-    private static final long LINK_PING_INTERVAL = 55 * 1000L; // ms
-    private static final long LINK_UNREACHABLE_TIMEOUT = 3 * LINK_PING_INTERVAL;
+    private static final long LINK_INBOUND_TIMEOUT_MS = 2 * 360 * 1000L; // ms (~2x library KEEPALIVE)
     /**
      * How often runBaseLoop() triggers maybeAnnounce() and path recovery, independent
      * of prunePeers(). This ensures announces fire even when the Controller scheduler is
@@ -1827,14 +1830,24 @@ public class RNS {
     //}
 
     public Boolean isUnreachable(ReticulumPeer peer) {
-        var result = peer.getDeleteMe();
-        var now = Instant.now();
-        var peerLastAccessTimestamp = peer.getLastAccessTimestamp();
-        if (peerLastAccessTimestamp.isBefore(now.minusMillis(LINK_UNREACHABLE_TIMEOUT))) {
-            log.debug("RNS - link is unreachable");
-            result = true;
+        if (peer.getDeleteMe()) {
+            return true;
         }
-        return result;
+        var link = peer.getPeerLink();
+        if (link == null || link.getStatus() == CLOSED) {
+            // No link, or the library/Channel already tore it down (a wedged Channel that hits
+            // 'retry count exceeded' closes the Link) — definitively unreachable.
+            return true;
+        }
+        // Liveness from the Link's native keepalive via the (now library-fixed) lastInbound,
+        // replacing the app-level Channel ping. If a wedged Channel had killed the link we'd have
+        // caught it via CLOSED above, so link-level liveness is a sufficient proxy here.
+        var lastInbound = link.getLastInbound();
+        if (nonNull(lastInbound) && lastInbound.isBefore(Instant.now().minusMillis(LINK_INBOUND_TIMEOUT_MS))) {
+            log.debug("RNS - link is unreachable (no inbound for > {}ms)", LINK_INBOUND_TIMEOUT_MS);
+            return true;
+        }
+        return false;
     }
 
     public void peerMisbehaved(Peer peer) {

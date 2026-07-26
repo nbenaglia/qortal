@@ -52,7 +52,6 @@ import org.qortal.network.message.*;
 import org.qortal.network.message.MessageException;
 import org.qortal.network.task.MessageTask;
 import org.qortal.network.task.ReticulumMessageTask;
-import org.qortal.network.task.ReticulumPingTask;
 import org.qortal.settings.Settings;
 import org.qortal.utils.ExecuteProduceConsume.Task;
 import org.qortal.utils.NTP;
@@ -567,6 +566,20 @@ public class ReticulumPeer implements Peer {
             result = false;
         }
         return result;
+    }
+
+    /**
+     * True if this peer's Reticulum Link is gone — {@code null} or {@code CLOSED}. Used by
+     * Network.prunePeers() to reconcile dead Reticulum peers out of the connected/handshaked
+     * lists: a peer added via {@link #makePeerAvailable()} but never tracked in RNS's
+     * linkedPeers/incomingPeers (e.g. a duplicate skipped by addLinkedPeer's dedup race) is never
+     * removed by RNS teardown, so it leaks there and bloats the scheduler's ping scan. A CLOSED
+     * link never recovers (reconnect creates a fresh Link), so removing such a peer cannot disrupt
+     * a live connection. Deliberately NOT true for PENDING/HANDSHAKE/STALE — those may still be
+     * establishing or recovering, and RNS owns their lifecycle.
+     */
+    public boolean isLinkClosed() {
+        return this.peerLink == null || this.peerLink.getStatus() == CLOSED;
     }
 
     public void makePeerAvailable() {
@@ -1276,37 +1289,14 @@ public class ReticulumPeer implements Peer {
     }
 
     public Task getPingTask(Long now) {
-        // Only initiator peers send application-level pings; non-initiators reply to them.
-        if (!Boolean.TRUE.equals(isInitiator)) {
-            return null;
-        }
-
-        // Pings not enabled yet?
-        if (now == null || this.lastPingSent == null) {
-            return null;
-        }
-
-        // ping only possible over ACTIVE Link
-        if (nonNull(this.peerLink)) {
-            if (this.peerLink.getStatus() != ACTIVE) {
-                return null;
-            }
-            //log.debug("Ping ReticulumPeer {}", peerLink.getDestination().getHexHash());
-        } else {
-            log.debug("Cannot ping ReticulumPeer - Link is {} (null)", peerLink);
-            return null;
-        }
-
-        // Time to send another ping?
-        if (now < this.lastPingSent + PING_INTERVAL) {
-            return null; // Not yet
-        }
-
-        // Not strictly true, but prevents this peer from being immediately chosen again
-        this.lastPingSent = now;
-
-        log.info("[{}] Scheduling ping to {}", getPeerConnectionId(), peerLink.getDestination().getHexHash());
-        return new ReticulumPingTask(this, now);
+        // App-level Reticulum pings are DISABLED (test-28). Liveness now comes from the Reticulum
+        // Link's native keepalive via the (library-fixed) lastInbound timestamp, evaluated by
+        // RNS.isUnreachable — a lightweight link-level mechanism. This replaces the old synchronous
+        // Channel PING/PONG (a blocking getResponse per initiator peer every 55s) which added
+        // Channel load, tied up Network-Worker threads, and could itself trigger the Channel
+        // 'retry count exceeded' teardowns we're trying to reduce. A wedged Channel still closes
+        // the Link, so isUnreachable's CLOSED check covers the Channel-death case.
+        return null;
     }
 
     //// low-level Link (packet) ping
