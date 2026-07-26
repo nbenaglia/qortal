@@ -91,6 +91,12 @@ public class Network {
      */
     private static final long SHUTDOWN_UPNP_TIMEOUT_MS = 5 * 1000L; // ms
     /**
+     * Wall-clock budget for re-persisting known peers during shutdown. The save is one INSERT per
+     * peer and non-critical, so it is capped to keep total shutdown well under stop.sh's 120s
+     * force-kill on nodes with large peer tables (test-25 wadin hang).
+     */
+    private static final long SHUTDOWN_PEER_SAVE_BUDGET_MS = 10 * 1000L; // ms
+    /**
      * Bounds on how long the scheduler loop sleeps when it finds no task due. See
      * {@link #idleSleepMillis}.
      */
@@ -2952,6 +2958,29 @@ public class Network {
             // Continue with other pruning operations
         }
 
+        // Reconcile dead Reticulum peers out of the connected/handshaked lists. A Reticulum peer is
+        // added here by ReticulumPeer.makePeerAvailable() on link-up; RNS normally removes it (via
+        // makePeerUnavailable()) when it tears the link down. But a peer that never entered RNS's
+        // linkedPeers/incomingPeers — e.g. a duplicate skipped by addLinkedPeer's dedup race — is
+        // never torn down by RNS, so it leaks here forever. The scheduler's ping scan then iterates
+        // an ever-growing list, raising Network-Scheduler CPU without bound (the wadin "canary",
+        // test-20..22). Sweeping only peers whose Link is null/CLOSED is safe and self-healing: a
+        // CLOSED link never recovers (reconnect makes a fresh Link), so no live connection is cut,
+        // and it catches leaked peers regardless of how they got in. removeConnectedPeer() also
+        // removes from handshakedPeers/outbound.
+        try {
+            for (Peer peer : this.getImmutableConnectedPeers()) {
+                if (peer.getPeerMetaType() == PeerMetaType.RETICULUM
+                        && peer instanceof ReticulumPeer
+                        && ((ReticulumPeer) peer).isLinkClosed()) {
+                    this.removeConnectedPeer(peer);
+                }
+            }
+        } catch (Exception e) {
+            LOGGER.error("Error reconciling dead Reticulum peers: {}", e.getMessage(), e);
+            // Continue with other pruning operations
+        }
+
         // Disconnect peers that have stuck writes (no progress for 60 seconds)
         final long WRITE_STUCK_TIMEOUT = 60_000L;
         List<Peer> stuckWritePeers = this.getImmutableConnectedPeers().stream()
@@ -3298,8 +3327,20 @@ public class Network {
 
                 int addedPeerCount = 0;
 
-                // save all known peers for next start up
+                // Save known peers for next start up, but TIME-BOXED. This re-inserts every known
+                // peer one row at a time (HSQLDBNetworkRepository.save → a per-row INSERT with AVL
+                // index maintenance + disk I/O). On a long-lived public node with a large peer
+                // table this loop alone ran past stop.sh's 120s force-kill — the wadin shutdown
+                // hang confirmed by the test-25 full-stack dumps (thread RUNNABLE in
+                // Network.shutdown:save → HSQLDB StatementInsert). Persisting peers is non-critical
+                // (the node re-bootstraps and re-learns), so cap the effort and move on.
+                final long peerSaveDeadline = System.currentTimeMillis() + SHUTDOWN_PEER_SAVE_BUDGET_MS;
                 for (PeerData knownPeerToProcess : knownPeersToProcess) {
+                    if (System.currentTimeMillis() > peerSaveDeadline) {
+                        LOGGER.warn("Known-peer save budget ({}ms) reached after {} of {} peers - stopping early",
+                                SHUTDOWN_PEER_SAVE_BUDGET_MS, addedPeerCount, knownPeersToProcess.size());
+                        break;
+                    }
                     if (knownPeerToProcess.getPeerMetaType() == PeerMetaType.RETICULUM) {
                         // don't save any ReticulumPeer
                         continue;
