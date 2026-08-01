@@ -61,7 +61,8 @@ public class ConnectedPeer {
     public String aspect;          // BASE (core) / DATA (qdn)
     public Long lastInbound;       // epoch millis of last inbound link traffic (real liveness signal)
     public Long rtt;               // link round-trip time (ms)
-    public String destinationHash; // peer's Reticulum identity (hex)
+    public String linkId;          // per-link unique id (hex) — distinguishes concurrent links, incl. inbound
+    public String destinationHash; // remote peer's destination hash (hex); only set for OUTBOUND/initiator links
     public Boolean reachable;      // inverse of RNS.isUnreachable()
 
     // Needed for DeSerialization
@@ -139,9 +140,20 @@ public class ConnectedPeer {
                 if (rnsPeer.getPeerAspect() != null) {
                     this.aspect = rnsPeer.getPeerAspect().name();
                 }
-                if (rnsPeer.getDestinationHash() != null) {
+
+                // destinationHash is only the REMOTE peer's hash for OUTBOUND/initiator links. For
+                // INBOUND links ReticulumPeer.getDestinationHash() returns *our own* local aspect
+                // destination (every inbound BASE peer would report the same hash, making distinct
+                // links look like duplicates), and the remote's identity is unknown because the
+                // initiator does not identify() over the link. So only surface it when we initiated.
+                if (Boolean.TRUE.equals(rnsPeer.getIsInitiator()) && rnsPeer.getDestinationHash() != null) {
                     this.destinationHash = encodeHexString(rnsPeer.getDestinationHash());
                 }
+
+                // ReticulumPeer.getPeersVersionString() is a hardcoded floor ("6.1.0") because the
+                // Reticulum handshake does not yet carry the remote's version (future announce-appData
+                // work). Until then, surface this node's own running version rather than that floor.
+                this.version = Controller.getInstance().getVersionStringWithoutPrefix();
 
                 Link link = rnsPeer.getPeerLink();
                 if (link != null) {
@@ -152,6 +164,22 @@ public class ConnectedPeer {
                         this.lastInbound = link.getLastInbound().toEpochMilli();
                     }
                     this.rtt = link.getRtt();
+                    // Per-link unique id — the reliable way to tell concurrent links apart, including
+                    // multiple inbound links that all share our local destination hash above.
+                    if (link.getLinkId() != null) {
+                        this.linkId = encodeHexString(link.getLinkId());
+                    }
+                }
+
+                // For OUTBOUND links the base constructor already set address/nodeId to the remote's
+                // destination hash (== destinationHash above) — correct and useful. For INBOUND links
+                // both were derived from getPeersNodeId()/peerData, which resolve to *our own* local
+                // aspect destination, so every inbound peer of an aspect looked identical. The remote's
+                // real node id/address is unknown (no identify() over the link), so surface the per-link
+                // id instead: it keeps these fields populated and unique per inbound connection.
+                if (!Boolean.TRUE.equals(rnsPeer.getIsInitiator()) && this.linkId != null) {
+                    this.nodeId = this.linkId;
+                    this.address = this.linkId;
                 }
 
                 this.reachable = !RNS.getInstance().isUnreachable(rnsPeer);
