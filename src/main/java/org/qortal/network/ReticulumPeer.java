@@ -283,6 +283,14 @@ public class ReticulumPeer implements Peer {
         this.isInitiator = false;
         //this.isVacant = false;
 
+        // This constructor is only used for INBOUND links, which are already established when the
+        // library hands them to us via baseClientConnected()/dataClientConnected(). Because the link
+        // is already ACTIVE, the linkEstablished() callback registered below will never fire for it,
+        // so linkEstablishedTime (which getConnectionEstablishedTime()/getConnectionAge() rely on)
+        // would stay -1 and the peer's reported age would be stuck at "connecting...". Record the
+        // establishment time here — accepting the inbound link is effectively its establishment.
+        this.linkEstablishedTime = System.currentTimeMillis();
+
         this.peerLink.setLinkEstablishedCallback(this::linkEstablished);
         this.peerLink.setLinkClosedCallback(this::linkClosed);
         this.peerLink.setPacketCallback(this::linkPacketReceived);
@@ -617,8 +625,13 @@ public class ReticulumPeer implements Peer {
         link.setLinkClosedCallback(this::linkClosed);
         // For incoming peers the constructor fires before the handshake, so getRemoteIdentity()
         // was null then. Resolve it now that the link is established.
-        if (!Boolean.TRUE.equals(isInitiator) && this.serverIdentity == null) {
-            this.serverIdentity = link.getRemoteIdentity();
+        if (!Boolean.TRUE.equals(isInitiator)) {
+            if (this.serverIdentity == null) {
+                this.serverIdentity = link.getRemoteIdentity();
+            }
+            // Identity is known now, so drop any older incoming links from the same remote+aspect
+            // immediately rather than waiting up to ~60s for the next prunePeers() dedup cycle.
+            RNS.getInstance().dedupIncomingPeerByIdentity(this);
         }
         log.info("peerLink {} established (link: {}) with peer: hash - {}, link destination hash: {}",
             encodeHexString(peerLink.getLinkId()), encodeHexString(link.getLinkId()), encodeHexString(destinationHash),

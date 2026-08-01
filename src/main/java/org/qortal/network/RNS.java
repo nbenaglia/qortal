@@ -1702,6 +1702,14 @@ public class RNS {
                     .anyMatch(p -> Arrays.equals(p.getDestinationHash(), peer.getDestinationHash()));
             if (duplicate) {
                 log.debug("addLinkedPeer: skipping duplicate for {}", encodeHexString(peer.getDestinationHash()));
+                // The loser was built via new ReticulumPeer(dhash), whose constructor already called
+                // initPeerLink() and sent the LINKREQUEST — so its Link is live (PENDING/establishing)
+                // even though we're discarding the peer. Closing it here prevents a leaked local
+                // watchdog thread AND stops the half-formed link from establishing on the remote as a
+                // spurious incoming peer (which would itself become a duplicate the remote must prune).
+                // The loser always holds its own fresh Link (distinct from the retained peer's), so
+                // closing it cannot disturb the live connection. Non-blocking volatile write only.
+                peer.closePeerLinkNonBlocking();
                 return;
             }
             this.linkedPeers.add(peer);
@@ -1786,6 +1794,53 @@ public class RNS {
             }
             this.incomingPeers.add(peer);
             this.immutableIncomingPeers = List.copyOf(this.incomingPeers);
+        }
+    }
+
+    /**
+     * Proactively evict duplicate incoming peers as soon as the remote identity is known.
+     * <p>
+     * {@link #addIncomingPeer} runs at link-construction time (from baseClientConnected/
+     * dataClientConnected) when {@code getRemoteIdentity()} is still null because the handshake
+     * hasn't completed — so its identity-based dedup is skipped and multiple incoming links from
+     * the same remote+aspect accumulate until the next {@link #prunePeers} cycle (~60s). This is
+     * called from {@link ReticulumPeer#linkEstablished} once {@code serverIdentity} resolves, so
+     * redundant links are dropped within seconds instead. The {@code keep} peer (the just-
+     * established link) is retained; every other incoming peer with the same identity+aspect is
+     * removed. Runs on rnsWorkerPool to avoid mutating the peer list from the Reticulum I/O thread
+     * (same discipline as {@link #markPeerForImmediateRemoval}). The prunePeers() pass remains as a
+     * backstop.
+     */
+    public void dedupIncomingPeerByIdentity(ReticulumPeer keep) {
+        if (this.isShuttingDown) return;
+        Identity keepId = keep.getServerIdentity();
+        if (keepId == null) return;
+        String keepAspect = (keep.getPeerAspect() == RNSCommon.PeerAspect.DATA) ? QDN_ASPECT : CORE_ASPECT;
+        byte[] keepHash = hashFromNameAndIdentity(keepAspect, keepId);
+        try {
+            rnsWorkerPool.submit(() -> {
+                List<ReticulumPeer> toRemove = new ArrayList<>();
+                synchronized (this.incomingPeers) {
+                    for (ReticulumPeer p : this.incomingPeers) {
+                        if (p == keep) continue;
+                        Identity pid = p.getServerIdentity();
+                        if (pid == null) continue;
+                        String pAspect = (p.getPeerAspect() == RNSCommon.PeerAspect.DATA) ? QDN_ASPECT : CORE_ASPECT;
+                        if (pAspect.equals(keepAspect)
+                                && Arrays.equals(hashFromNameAndIdentity(pAspect, pid), keepHash)) {
+                            toRemove.add(p);
+                        }
+                    }
+                }
+                // removeIncomingPeer() mutates the list itself, so evict outside the loop/lock above.
+                for (ReticulumPeer p : toRemove) {
+                    log.info("dedupIncomingPeerByIdentity: removing duplicate {} incoming peer from {}",
+                            keepAspect, encodeHexString(keepHash));
+                    removeIncomingPeer(p);
+                }
+            });
+        } catch (java.util.concurrent.RejectedExecutionException e) {
+            // Pool shut down — prunePeers() will clean up on next cycle
         }
     }
 
