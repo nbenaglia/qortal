@@ -1081,6 +1081,10 @@ public class RNS {
         newPeer.setPeerLinkHash(link.getHash());
         newPeer.setPeerAspect(RNSCommon.PeerAspect.BASE);
         newPeer.setMessageMagic(getMessageMagic());
+        // Capture the initiator's identity once it identifies over the link (see ReticulumPeer's
+        // initiator-side link.identify()). Until this fires, an inbound peer has no remote identity
+        // and identity-based dedup cannot collapse duplicate inbound links from the same remote.
+        link.setRemoteIdentifiedCallback((l, id) -> onIncomingPeerIdentified(newPeer, id));
         // createPeerBuffer() rather than getOrInitPeerBuffer() — avoids synchronized(link)
         // contention on the broadcast path (see ReticulumPeer.createPeerBuffer javadoc).
         newPeer.createPeerBuffer();
@@ -1096,6 +1100,8 @@ public class RNS {
         newPeer.setPeerLinkHash(link.getHash());
         newPeer.setPeerAspect(RNSCommon.PeerAspect.DATA);
         newPeer.setMessageMagic(getMessageMagic());
+        // See baseClientConnected: resolve the initiator's identity for identity-based dedup.
+        link.setRemoteIdentifiedCallback((l, id) -> onIncomingPeerIdentified(newPeer, id));
         newPeer.createPeerBuffer();
         addIncomingPeer(newPeer);
         log.info("***> Data Client connected, data link: {}", encodeHexString(link.getLinkId()));
@@ -1811,6 +1817,23 @@ public class RNS {
      * (same discipline as {@link #markPeerForImmediateRemoval}). The prunePeers() pass remains as a
      * backstop.
      */
+    /**
+     * Called from the inbound link's remoteIdentified callback (registered in baseClientConnected/
+     * dataClientConnected) once the initiator has identified itself via link.identify(). Records the
+     * resolved remote identity on the peer — the constructor could not, because the handshake hadn't
+     * completed and getRemoteIdentity() was null then — so identity-based dedup finally has a key to
+     * work with. Then collapses any older duplicate inbound links from the same remote+aspect,
+     * keeping this newly-identified one.
+     */
+    public void onIncomingPeerIdentified(ReticulumPeer peer, Identity identity) {
+        if (identity == null) return;
+        peer.setServerIdentity(identity);
+        log.info("inbound {} peer identified as {} (link {})",
+                peer.getPeerAspect(), encodeHexString(identity.getHash()),
+                peer.getPeerLink() != null ? encodeHexString(peer.getPeerLink().getLinkId()) : "null");
+        dedupIncomingPeerByIdentity(peer);
+    }
+
     public void dedupIncomingPeerByIdentity(ReticulumPeer keep) {
         if (this.isShuttingDown) return;
         Identity keepId = keep.getServerIdentity();

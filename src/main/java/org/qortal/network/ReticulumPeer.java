@@ -645,6 +645,21 @@ public class ReticulumPeer implements Peer {
         // CAS guard inside createPeerBuffer() prevents double-creation.
         createPeerBuffer();
         if (Boolean.TRUE.equals(isInitiator)) {
+            // Identify ourselves to the remote (server) side. link.identify() requires the link to be
+            // the initiator's and ACTIVE — both hold here. This lets the server resolve our identity
+            // via its remoteIdentified callback (see RNS.baseClientConnected/dataClientConnected);
+            // without it, inbound links on the remote carry no identity and its identity-based dedup
+            // (dedupIncomingPeerByIdentity / prunePeers) can never fire.
+            try {
+                Identity myIdentity = RNS.getInstance().getServerIdentity();
+                if (myIdentity != null) {
+                    link.identify(myIdentity);
+                } else {
+                    log.warn("linkEstablished - no local serverIdentity to identify() as for {}", encodeHexString(destinationHash));
+                }
+            } catch (Exception e) {
+                log.warn("linkEstablished - identify() failed for {}: {}", encodeHexString(destinationHash), e.getMessage());
+            }
             // Arm the ping timer: schedule first ping one interval from now.
             this.lastPingSent = ntpNow;
         }
