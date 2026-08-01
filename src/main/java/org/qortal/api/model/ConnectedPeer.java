@@ -7,7 +7,13 @@ import org.qortal.data.block.BlockSummaryData;
 import org.qortal.data.network.PeerData;
 import org.qortal.network.Handshake;
 import org.qortal.network.Peer;
+import org.qortal.network.RNS;
+import org.qortal.network.ReticulumPeer;
 import org.qortal.network.helper.PeerCapabilities;
+
+import io.reticulum.link.Link;
+
+import static org.apache.commons.codec.binary.Hex.encodeHexString;
 
 import javax.xml.bind.annotation.XmlAccessType;
 import javax.xml.bind.annotation.XmlAccessorType;
@@ -46,6 +52,17 @@ public class ConnectedPeer {
 
     public String age;
     public Boolean isTooDivergent;
+
+    // Reticulum-specific fields. Populated only when the underlying peer is a ReticulumPeer;
+    // null (and hence absent from the JSON) for IP peers. Note: 'direction' above already
+    // conveys initiator-vs-incoming — for a ReticulumPeer isOutbound()==isInitiator, so an
+    // initiator maps to OUTBOUND and an incoming peer to INBOUND.
+    public String linkStatus;      // ACTIVE / PENDING / HANDSHAKE / STALE / CLOSED
+    public String aspect;          // BASE (core) / DATA (qdn)
+    public Long lastInbound;       // epoch millis of last inbound link traffic (real liveness signal)
+    public Long rtt;               // link round-trip time (ms)
+    public String destinationHash; // peer's Reticulum identity (hex)
+    public Boolean reachable;      // inverse of RNS.isUnreachable()
 
     // Needed for DeSerialization
     public ConnectedPeer() {
@@ -110,6 +127,37 @@ public class ConnectedPeer {
         // Only include isTooDivergent decision if we've had the opportunity to request block summaries this peer
         if (peer.getLastTooDivergentTime() != null) {
             this.isTooDivergent = Controller.wasRecentlyTooDivergent.test(peer);
+        }
+
+        // Surface Reticulum-specific link details for mesh peers. Wrapped in try/catch so a
+        // link tearing down mid-read (e.g. peerLink nulled by another thread) can't break the
+        // whole peer list — the affected peer simply reports whatever fields resolved.
+        if (peer instanceof ReticulumPeer) {
+            try {
+                ReticulumPeer rnsPeer = (ReticulumPeer) peer;
+
+                if (rnsPeer.getPeerAspect() != null) {
+                    this.aspect = rnsPeer.getPeerAspect().name();
+                }
+                if (rnsPeer.getDestinationHash() != null) {
+                    this.destinationHash = encodeHexString(rnsPeer.getDestinationHash());
+                }
+
+                Link link = rnsPeer.getPeerLink();
+                if (link != null) {
+                    if (link.getStatus() != null) {
+                        this.linkStatus = link.getStatus().name();
+                    }
+                    if (link.getLastInbound() != null) {
+                        this.lastInbound = link.getLastInbound().toEpochMilli();
+                    }
+                    this.rtt = link.getRtt();
+                }
+
+                this.reachable = !RNS.getInstance().isUnreachable(rnsPeer);
+            } catch (Exception e) {
+                // Best-effort enrichment only; leave any unresolved fields null.
+            }
         }
     }
 
