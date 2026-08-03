@@ -1690,19 +1690,29 @@ public class Network {
             // This handles cases where we have an inbound connection on an ephemeral port
             // but allKnownPeers has the listen port (common with peer discovery/persistence)
             // EXCEPTION: For fixed peers, allow connection attempts if existing connection is wrong direction
+            //
+            // Precompute nodeId -> connected peer ONCE. Previously the removeIf below re-scanned
+            // the entire connected-peers list for every known peer, making this O(allKnownPeers x
+            // connectedPeers). On IP-starved nodes with a large known-peer table this scan runs on
+            // the Network-Scheduler thread every second (the fast-path guard only skips it once the
+            // outbound-IP target is met) and dominated scheduler CPU (test-31: caught mid-scan in
+            // ~26% of thread dumps). Building the map first makes it O(allKnownPeers + connectedPeers).
+            Map<String, Peer> connectedByNodeId = new HashMap<>();
+            for (Peer connectedPeer : this.getImmutableConnectedPeers()) {
+                String nodeId = connectedPeer.getPeersNodeId();
+                if (nodeId != null)
+                    connectedByNodeId.putIfAbsent(nodeId, connectedPeer);
+            }
+
             peers.removeIf(peerData -> {
                 String peerAddress = peerData.getAddress().toString();
                 CachedNodeIdInfo cachedInfo = addressToNodeIdCache.get(peerAddress);
-                
+
                 if (cachedInfo != null) {
                     // We know this peer's nodeId - check if already connected
                     String candidateNodeId = cachedInfo.nodeId;
-                    Peer existingPeer = this.getImmutableConnectedPeers().stream()
-                            .filter(peer -> peer.getPeersNodeId() != null 
-                                   && peer.getPeersNodeId().equals(candidateNodeId))
-                            .findFirst()
-                            .orElse(null);
-                    
+                    Peer existingPeer = connectedByNodeId.get(candidateNodeId);
+
                     if (existingPeer != null) {
                         // Already connected to this nodeId - but check if direction is correct
                         // For fixed peers, if direction is wrong, allow reconnection attempt
@@ -2999,10 +3009,11 @@ public class Network {
         // Needs a mutable copy of the unmodifiableList
         List<Peer> handshakePeers = new ArrayList<>(this.getImmutableConnectedPeers());
 
-        // Disregard any ReticulumPeer (handled in RNS)
-        Predicate<Peer> isReticulumPeer = peer -> {
-            return this.getImmutableConnectedPeers().stream().anyMatch(p -> p.getPeerData().getPeerMetaType() == PeerMetaType.RETICULUM);
-        };
+        // Disregard any ReticulumPeer (handled in RNS). Note: this tests the peer passed to the
+        // predicate — the previous version ignored its parameter and did an anyMatch over the whole
+        // connected list, so it (a) removed EVERY peer whenever any reticulum peer was present and
+        // (b) was O(n^2) inside removeIf, a Network-Scheduler CPU sink.
+        Predicate<Peer> isReticulumPeer = peer -> peer.getPeerData().getPeerMetaType() == PeerMetaType.RETICULUM;
         handshakePeers.removeIf(isReticulumPeer);
 
         // Disregard peers that have completed handshake or only connected recently
@@ -3017,8 +3028,14 @@ public class Network {
         // Clean up peers with closed sockets (zombie connections)
         // These can block new connections due to duplicate detection during handshake
         // This catches peers in any handshake state (including COMPLETED) where the socket
-        // has been closed but the peer hasn't been removed from the connected list yet
+        // has been closed but the peer hasn't been removed from the connected list yet.
+        // IMPORTANT: exclude ReticulumPeer — it is socket-less (getSocketChannel() is always null,
+        // Peer.java default), so this filter matched every healthy mesh link and disconnected it as
+        // "socket closed" on each prune cycle (~every 90s). That was the dominant cause of the very
+        // short Reticulum link lifetimes (avg ~39s before this disconnect). Reticulum liveness is
+        // owned by RNS (isUnreachable / link watchdog), not by socket state.
         List<Peer> deadPeers = this.getImmutableConnectedPeers().stream()
+                .filter(peer -> peer.getPeerData().getPeerMetaType() != PeerMetaType.RETICULUM)
                 .filter(peer -> peer.getSocketChannel() == null || !peer.getSocketChannel().isOpen())
                 .collect(Collectors.toList());
 
@@ -3032,8 +3049,10 @@ public class Network {
         // This catches the case where onDisconnect() might have failed to remove a peer
         // from handshakedPeers even though the socket is closed
         // NOTE: We only check for closed/null sockets, NOT isStopping() - that flag is set
-        // during normal disconnect flow and would incorrectly remove all disconnecting peers
+        // during normal disconnect flow and would incorrectly remove all disconnecting peers.
+        // Same Reticulum exclusion as above (socket-less peers are not zombies).
         List<Peer> zombieHandshakedPeers = this.getImmutableHandshakedPeers().stream()
+                .filter(peer -> peer.getPeerData().getPeerMetaType() != PeerMetaType.RETICULUM)
                 .filter(peer -> peer.getSocketChannel() == null || !peer.getSocketChannel().isOpen())
                 .collect(Collectors.toList());
 

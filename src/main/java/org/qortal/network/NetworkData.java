@@ -13,6 +13,7 @@ import org.qortal.controller.arbitrary.ArbitraryDataFileManager;
 import org.qortal.controller.arbitrary.ArbitraryMetadataManager;
 import org.qortal.crypto.Crypto;
 import org.qortal.data.network.PeerData;
+import org.qortal.network.RNSCommon.PeerMetaType;
 import org.qortal.network.message.*;
 import org.qortal.network.task.*;
 import org.qortal.repository.DataException;
@@ -2486,8 +2487,12 @@ public class NetworkData {
         // Clean up peers with closed sockets (zombie connections)
         // These can block new connections due to duplicate detection during handshake
         // This catches peers in any handshake state (including COMPLETED) where the socket
-        // has been closed but the peer hasn't been removed from the connected list yet
+        // has been closed but the peer hasn't been removed from the connected list yet.
+        // Exclude ReticulumPeer: it is socket-less (getSocketChannel() is always null) so this
+        // filter would treat every mesh peer as a dead socket. DATA mesh peers are normally tracked
+        // by RNS rather than registered here, but keep the guard for parity with Network.prunePeers.
         List<Peer> deadPeers = this.getImmutableConnectedPeers().stream()
+                .filter(peer -> peer.getPeerData().getPeerMetaType() != PeerMetaType.RETICULUM)
                 .filter(peer -> peer.getSocketChannel() == null || !peer.getSocketChannel().isOpen())
                 .collect(Collectors.toList());
 
@@ -2501,8 +2506,10 @@ public class NetworkData {
         // This catches the case where onDisconnect() might have failed to remove a peer
         // from handshakedPeers even though the socket is closed
         // NOTE: We only check for closed/null sockets, NOT isStopping() - that flag is set
-        // during normal disconnect flow and would incorrectly remove all disconnecting peers
+        // during normal disconnect flow and would incorrectly remove all disconnecting peers.
+        // Same Reticulum exclusion as above.
         List<Peer> zombieHandshakedPeers = this.getImmutableHandshakedPeers().stream()
+                .filter(peer -> peer.getPeerData().getPeerMetaType() != PeerMetaType.RETICULUM)
                 .filter(peer -> peer.getSocketChannel() == null || !peer.getSocketChannel().isOpen())
                 .collect(Collectors.toList());
 
