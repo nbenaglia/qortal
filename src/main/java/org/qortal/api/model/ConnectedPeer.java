@@ -150,10 +150,10 @@ public class ConnectedPeer {
                     this.destinationHash = encodeHexString(rnsPeer.getDestinationHash());
                 }
 
-                // ReticulumPeer.getPeersVersionString() is a hardcoded floor ("6.1.0") because the
-                // Reticulum handshake does not yet carry the remote's version (future announce-appData
-                // work). Until then, surface this node's own running version rather than that floor.
-                this.version = Controller.getInstance().getVersionStringWithoutPrefix();
+                // Real peer version, advertised in the announce appData (QAN1) and stored on the peer
+                // (see RNS.getNewPeer / onIncomingPeerIdentified). Falls back to the "6.1.0" floor
+                // until that peer's announce has been processed.
+                this.version = rnsPeer.getPeersVersionString();
 
                 Link link = rnsPeer.getPeerLink();
                 if (link != null) {

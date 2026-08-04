@@ -1451,7 +1451,11 @@ public class ReticulumPeer implements Peer {
     }
 
     public String getPeersVersionString() {
-        return "6.1.0";
+        // Real version comes from the peer's announce appData (QAN1), set via setPeersVersionString()
+        // from RNS.getNewPeer()/onIncomingPeerIdentified(). Falls back to the historical floor until
+        // that peer's announce has been seen. Display-only; getPeersVersion() (the numeric min-
+        // version gate) is intentionally left at the floor.
+        return this.peersVersionString != null ? this.peersVersionString : "6.1.0";
     }
 
     public void setPeersVersion(String versionString, long version) {
