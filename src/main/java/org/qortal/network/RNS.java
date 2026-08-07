@@ -152,7 +152,16 @@ public class RNS {
     // PENDING_FAILURE_BACKOFF_MS so the backbone can provide a fresh announce path.
     private final java.util.concurrent.ConcurrentHashMap<String, Long> pendingLinkFailureMs =
             new java.util.concurrent.ConcurrentHashMap<>();
-    private static final long PENDING_FAILURE_BACKOFF_MS = 60_000L; // 60s; cull is now fast so 5min is too conservative
+    private static final long PENDING_FAILURE_BACKOFF_MS = 60_000L; // base backoff (first failure); 60s
+    // Consecutive PENDING/link failures per peer hash (BASE and DATA hashes are distinct, so one map
+    // serves both). Drives CAPPED EXPONENTIAL backoff: a permanently-unreachable peer (e.g. a mis-
+    // configured/partitioned mesh) would otherwise be retried every ~120s forever, each retry firing
+    // a PENDING link → expirePath() cull cascade → sustained reconnect-thread CPU. Backoff doubles per
+    // failure up to MAX_PENDING_FAILURE_BACKOFF_MS, so stale peers become effectively dormant. Reset on
+    // a successful ACTIVE connection (confirmPeerHash) so transient outages aren't penalised long-term.
+    private final java.util.concurrent.ConcurrentHashMap<String, Integer> pendingFailureCount =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    private static final long MAX_PENDING_FAILURE_BACKOFF_MS = 30 * 60_000L; // 30 min cap
 
     /**
      * Maintain two lists for each subset of peers
@@ -278,6 +287,37 @@ public class RNS {
     private final Set<String> loadedDataPeerHashes = Collections.synchronizedSet(new HashSet<>());
     private final java.util.concurrent.ConcurrentHashMap<String, Long> pendingDataLinkFailureMs =
             new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * Record a PENDING/link-establishment failure for a peer: stamp the failure time in the
+     * aspect-specific time map and increment the shared failure counter (for exponential backoff).
+     */
+    private void recordPendingFailure(String hashHex,
+            java.util.concurrent.ConcurrentHashMap<String, Long> timeMap) {
+        timeMap.put(hashHex, System.currentTimeMillis());
+        pendingFailureCount.merge(hashHex, 1, Integer::sum);
+    }
+
+    /**
+     * Capped exponential backoff window for a peer: {@code 60s, 120s, 240s, … , 30min}. The window
+     * grows with the consecutive-failure count so peers that never connect are retried ever less
+     * frequently (bounding PENDING-link creation and its expirePath cull cascade), while a
+     * first/occasional failure still retries quickly.
+     */
+    private long pendingBackoffMs(String hashHex) {
+        int count = pendingFailureCount.getOrDefault(hashHex, 0);
+        if (count <= 1) return PENDING_FAILURE_BACKOFF_MS;
+        int shift = Math.min(count - 1, 9); // guard against overflow; cap below clamps the value anyway
+        long ms = PENDING_FAILURE_BACKOFF_MS << shift;
+        return Math.min(ms, MAX_PENDING_FAILURE_BACKOFF_MS);
+    }
+
+    /** Clear failure/backoff state for a peer that has connected successfully. */
+    private void clearPendingFailure(String hashHex) {
+        pendingFailureCount.remove(hashHex);
+        pendingLinkFailureMs.remove(hashHex);
+        pendingDataLinkFailureMs.remove(hashHex);
+    }
 
     /** Called by ReticulumPeer.linkClosed() to kick the announce/path-recovery cycle soon.
      *  Uses a 5s delay rather than 0 to avoid tight reconnect loops when links close rapidly
@@ -499,6 +539,12 @@ public class RNS {
                 //log.info("template: {}", template);
                 var renderedConfig = jnj.render(template, context);
                 //log.info("rendered template - {}", renderedConfig);
+                // Delete any existing config first. Files.write(CREATE, WRITE) does NOT truncate, so
+                // regenerating a SHORTER config (e.g. after lowering reticulumDesiredClientInterfaces)
+                // left the old file's trailing bytes in place — a stale/duplicated interface, and
+                // sometimes a corrupt tail. Deleting guarantees the rendered file is exactly the new
+                // content. (The fallback path below already uses Files.copy REPLACE_EXISTING.)
+                Files.deleteIfExists(configFile);
                 Files.write(configFile, renderedConfig.getBytes(), CREATE, WRITE);
             } catch (Exception e) {
                 log.error("Failed to render config file - creating fallback default  config file", e);
@@ -659,6 +705,19 @@ public class RNS {
                                         // a LINKREQUEST via outbound(Packet)) and starves announce/reconnect tasks.
                                         // The PENDING-failure backoff naturally rotates through peers across cycles.
                                         int outgoingLinksCreated = 0;
+                                        // Precompute the identity hashes of ACTIVE incoming BASE peers ONCE per cycle.
+                                        // Previously this was recomputed per target via a stream + hashFromNameAndIdentity
+                                        // (a SHA-256) over every incoming peer — O(targets × incoming) crypto hashing each
+                                        // cycle. A set lookup makes the per-target check O(1).
+                                        final Set<String> activeIncomingBaseHashes = new HashSet<>();
+                                        for (ReticulumPeer ip : getImmutableIncomingPeers()) {
+                                            Link ipl = ip.getPeerLink();
+                                            Identity rid = ip.getServerIdentity();
+                                            if (nonNull(ipl) && ipl.getStatus() == ACTIVE && rid != null) {
+                                                activeIncomingBaseHashes.add(
+                                                        encodeHexString(hashFromNameAndIdentity(CORE_ASPECT, rid)));
+                                            }
+                                        }
                                         for (String hashHex : reconnectTargets) {
                                             try {
                                                 byte[] dhash = org.apache.commons.codec.binary.Hex.decodeHex(hashHex);
@@ -669,18 +728,9 @@ public class RNS {
                                                 // Skip peers already ACTIVE as incoming — broadcast() covers them,
                                                 // and creating a duplicate outgoing link doubles the Channel teardown
                                                 // rate, driving more expirePath() culls and accumulating spurious
-                                                // incoming connections on the remote end.
-                                                boolean alreadyIncoming = getImmutableIncomingPeers().stream()
-                                                        .filter(p -> {
-                                                            Link pl = p.getPeerLink();
-                                                            return nonNull(pl) && pl.getStatus() == ACTIVE;
-                                                        })
-                                                        .anyMatch(p -> {
-                                                            Identity remoteId = p.getServerIdentity();
-                                                            if (remoteId == null) return false;
-                                                            return Arrays.equals(hashFromNameAndIdentity(CORE_ASPECT, remoteId), dhash);
-                                                        });
-                                                if (alreadyIncoming) continue;
+                                                // incoming connections on the remote end. (O(1) set lookup — see the
+                                                // precomputed activeIncomingBaseHashes above.)
+                                                if (activeIncomingBaseHashes.contains(hashHex)) continue;
                                                 // hopsTo() is a ConcurrentHashMap.get() — no lock, always safe.
                                                 int hops = Transport.getInstance().hopsTo(dhash);
                                                 log.info("Path to {}: hops={}", hashHex,
@@ -705,7 +755,7 @@ public class RNS {
                                                 // When activeLinked==0, limit outgoing link creation to 1 per cycle to
                                                 // avoid flooding jobsLock; requestPath breaks the 0/0 deadlock for others.
                                                 long lastFailure = pendingLinkFailureMs.getOrDefault(hashHex, 0L);
-                                                boolean recentlyFailed = (System.currentTimeMillis() - lastFailure) < PENDING_FAILURE_BACKOFF_MS;
+                                                boolean recentlyFailed = (System.currentTimeMillis() - lastFailure) < pendingBackoffMs(hashHex);
                                                 boolean outgoingSlotFree = activeLinked > 0 || outgoingLinksCreated == 0;
                                                 Identity cachedIdentity = (!recentlyFailed && outgoingSlotFree)
                                                         ? IdentityKnownDestination.recall(dhash) : null;
@@ -873,7 +923,7 @@ public class RNS {
                                                         .anyMatch(p -> Arrays.equals(p.getDestinationHash(), dhash));
                                                 if (tracked) continue;
                                                 long lastFailure = pendingDataLinkFailureMs.getOrDefault(hashHex, 0L);
-                                                boolean recentlyFailed = (System.currentTimeMillis() - lastFailure) < PENDING_FAILURE_BACKOFF_MS;
+                                                boolean recentlyFailed = (System.currentTimeMillis() - lastFailure) < pendingBackoffMs(hashHex);
                                                 Identity cachedIdentity = recentlyFailed ? null
                                                         : IdentityKnownDestination.recall(dhash);
                                                 if (cachedIdentity != null) {
@@ -1669,7 +1719,7 @@ public class RNS {
         if (lnk != null && lnk.getStatus() == CLOSED) {
             log.warn("createLinkedPeerFromIdentity: LINKREQUEST to {} failed immediately — switching to requestPath backoff",
                     encodeHexString(destinationHash));
-            pendingLinkFailureMs.put(encodeHexString(destinationHash), System.currentTimeMillis());
+            recordPendingFailure(encodeHexString(destinationHash), pendingLinkFailureMs);
         }
     }
 
@@ -1686,7 +1736,7 @@ public class RNS {
         if (lnk != null && lnk.getStatus() == CLOSED) {
             log.warn("createLinkedDataPeerFromIdentity: LINKREQUEST to {} failed immediately — switching to requestPath backoff",
                     encodeHexString(destinationHash));
-            pendingDataLinkFailureMs.put(encodeHexString(destinationHash), System.currentTimeMillis());
+            recordPendingFailure(encodeHexString(destinationHash), pendingDataLinkFailureMs);
         }
     }
 
@@ -2196,9 +2246,9 @@ public class RNS {
                         // peer for PENDING_FAILURE_BACKOFF_MS, avoiding the cull cascade.
                         String phex = encodeHexString(p.getDestinationHash());
                         if (p.getPeerAspect() == RNSCommon.PeerAspect.DATA) {
-                            pendingDataLinkFailureMs.put(phex, System.currentTimeMillis());
+                            recordPendingFailure(phex, pendingDataLinkFailureMs);
                         } else {
-                            pendingLinkFailureMs.put(phex, System.currentTimeMillis());
+                            recordPendingFailure(phex, pendingLinkFailureMs);
                         }
                         removeLinkedPeer(p);
                         // Do NOT call pLink.teardown() here.
@@ -2349,6 +2399,9 @@ public class RNS {
     // Called from ReticulumPeer.createPeerBuffer() when a peer's buffer is confirmed ACTIVE.
     // Only initiator peers call this (non-initiators have our own destination hash, not the remote's).
     void confirmPeerHash(String hashHex, RNSCommon.PeerAspect aspect) {
+        // Peer is ACTIVE — clear any failure/backoff state so a future transient drop starts fresh
+        // rather than inheriting a long exponential-backoff window from earlier.
+        clearPendingFailure(hashHex);
         if (aspect == RNSCommon.PeerAspect.DATA) {
             boolean isNew = this.knownDataPeerHashes.add(hashHex);
             if (isNew) {
