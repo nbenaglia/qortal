@@ -1789,7 +1789,7 @@ public class ArbitraryDataFileManager extends Thread {
                             if (forwards != null) {
                                 // Remove by matching PeerData and message ID
                                 PeerData peerData = peer.getPeerData();
-                                forwards.removeIf(f -> f.requestingPeerData.equals(peerData) && f.messageId == originalMessage.getId());
+                                forwards.removeIf(f -> f.requestingPeerData.isSameAddress(peerData) && f.messageId == originalMessage.getId());
                             }
                         }
                     }

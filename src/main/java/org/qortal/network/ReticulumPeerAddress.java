@@ -46,4 +46,26 @@ public class ReticulumPeerAddress implements PeerAddress {
     @Override
     public String toString() { return encodeHexString(dhash); }
 
+    /**
+     * Two Reticulum addresses are the same peer iff they carry the same destination hash.
+     * <p>
+     * As with {@link IPPeerAddress#equals(Object)} this has to override {@link Object#equals(Object)}:
+     * callers only ever hold a {@link PeerAddress}, so an overload would never be selected.
+     */
+    @Override
+    public boolean equals(Object other) {
+        if (this == other)
+            return true;
+
+        if (!(other instanceof ReticulumPeerAddress))
+            return false;
+
+        return java.util.Arrays.equals(this.dhash, ((ReticulumPeerAddress) other).dhash);
+    }
+
+    @Override
+    public int hashCode() {
+        return java.util.Arrays.hashCode(this.dhash);
+    }
+
     }

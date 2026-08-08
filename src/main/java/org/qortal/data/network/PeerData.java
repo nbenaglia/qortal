@@ -112,7 +112,17 @@ public class PeerData {
 		this.failedSyncCount++;
 	}
 
-	public Boolean equals(PeerData against) {
+	/**
+	 * Returns true if both PeerData refer to the same peer address.
+	 * <p>
+	 * Deliberately NOT named {@code equals}: it was an {@code equals(PeerData)} overload returning a
+	 * boxed Boolean, so it never overrode {@link Object#equals(Object)}. Anything routing through a
+	 * collection ({@code list.contains(peerData)}, {@code HashMap} keys, {@code distinct()}) silently
+	 * got reference identity instead. The explicit name keeps that from being mistaken for value
+	 * equality again — PeerData still has no {@code equals(Object)}/{@code hashCode()}, so collections
+	 * continue to treat it by identity.
+	 */
+	public boolean isSameAddress(PeerData against) {
 		return this.getAddress().equals(against.getAddress());
 	}
 

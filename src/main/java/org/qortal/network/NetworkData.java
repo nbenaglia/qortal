@@ -2410,20 +2410,25 @@ public class NetworkData {
     }
 
     public boolean mergePeers(String addedBy, long addedWhen, List<PeerAddress> peerAddresses) throws DataException {
+        // Filter out duplicates, without resolving via DNS. Hash the (small) incoming batch and make
+        // a single pass over the known peers — see the matching comment in Network.mergePeersUnlocked
+        // for why the old O(n x m) nested form under this monitor hurt.
+        Set<PeerAddress> candidates = new HashSet<>(peerAddresses);
+        if (candidates.isEmpty()) {
+            return false;
+        }
+
         List<PeerData> newPeers;
         synchronized (this.allKnownPeers) {
             for (PeerData knownPeerData : this.allKnownPeers) {
-                // Filter out duplicates, without resolving via DNS
-                Predicate<PeerAddress> isKnownAddress = peerAddress -> knownPeerData.getAddress().equals(peerAddress);
-                peerAddresses.removeIf(isKnownAddress);
-            }
-
-            if (peerAddresses.isEmpty()) {
-                return false;
+                if (candidates.remove(knownPeerData.getAddress()) && candidates.isEmpty()) {
+                    // Every address in this batch was already known
+                    return false;
+                }
             }
 
             // Add leftover peer addresses to known peers list
-            newPeers = peerAddresses.stream()
+            newPeers = candidates.stream()
                     .map(peerAddress -> new PeerData(peerAddress, addedWhen, addedBy))
                     .collect(Collectors.toList());
 

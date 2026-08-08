@@ -3170,20 +3170,35 @@ public class Network {
         if (fixedNetwork != null && !fixedNetwork.isEmpty()) {
             return false;
         }
+        // Filter out duplicates, without resolving via DNS.
+        //
+        // This used to be a nested loop — for every known peer, a removeIf pass over the whole
+        // incoming list — i.e. O(allKnownPeers x peerAddresses) while holding the allKnownPeers
+        // monitor, once per inbound PEERS_V2 message. On a well-connected mainnet node that came to
+        // dominate a Network-Worker thread and blocked Network-Scheduler in getConnectablePeer
+        // (test-35: caught mid-merge in 14 of darlood's 40 thread dumps, 11 of the last 12).
+        //
+        // Hash the (small) incoming batch instead and make a single pass over the known peers:
+        // O(peerAddresses) to build, then one cheap probe per known peer, with an early exit as soon
+        // as the batch is exhausted. Hashing the *known* side instead would also be linear, but it
+        // allocates a set the size of the whole peer table on every message. Building the set here
+        // also de-duplicates within the batch, which the old loop never did.
+        Set<PeerAddress> candidates = new HashSet<>(peerAddresses);
+        if (candidates.isEmpty()) {
+            return false;
+        }
+
         List<PeerData> newPeers;
         synchronized (this.allKnownPeers) {
             for (PeerData knownPeerData : this.allKnownPeers) {
-                // Filter out duplicates, without resolving via DNS
-                Predicate<PeerAddress> isKnownAddress = peerAddress -> knownPeerData.getAddress().equals(peerAddress);
-                peerAddresses.removeIf(isKnownAddress);
-            }
-
-            if (peerAddresses.isEmpty()) {
-                return false;
+                if (candidates.remove(knownPeerData.getAddress()) && candidates.isEmpty()) {
+                    // Every address in this batch was already known
+                    return false;
+                }
             }
 
             // Add leftover peer addresses to known peers list
-            newPeers = peerAddresses.stream()
+            newPeers = candidates.stream()
                     .map(peerAddress -> new PeerData(peerAddress, addedWhen, addedBy))
                     .collect(Collectors.toList());
 
