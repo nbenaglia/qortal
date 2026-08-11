@@ -331,6 +331,14 @@ public class RNS {
 
     // Note: potentially create persistent serverIdentity (utility rnid) and load it from file
     public void start() {
+        // The constructor logs and continues when the Reticulum stack can't be built, so the
+        // singleton is published half-built. Dereferencing reticulum here would then NPE inside
+        // Network's startup. Refuse instead: meshStarted stays false and every consumer already
+        // guards on isMeshStarted(), so the node runs without the mesh rather than failing.
+        if (reticulum == null) {
+            log.error("Reticulum stack unavailable (see construction error above) — mesh will not start");
+            return;
+        }
 
         // create identity either from file or new (creating new keys)
         var serverIdentityPath = reticulum.getStoragePath().resolve("identities/"+APP_NAME);
@@ -921,11 +929,19 @@ public class RNS {
 
     public void shutdown() {
         this.isShuttingDown = true;
-        saveKnownPeerHashes();
-        saveKnownDataPeerHashes();
-        log.info("shutting down Reticulum");
-        baseDestination.setProofStrategy(ProofStrategy.PROVE_NONE);
-        dataDestination.setProofStrategy(ProofStrategy.PROVE_NONE);
+        // Controller calls this unconditionally, so it must tolerate a mesh that never started
+        // (no Reticulum stack, or start() refused): the destinations are null in that case, but
+        // the executors were still created by the constructor and must be closed either way.
+        boolean meshWasStarted = reticulum != null && baseDestination != null;
+        if (meshWasStarted) {
+            saveKnownPeerHashes();
+            saveKnownDataPeerHashes();
+            log.info("shutting down Reticulum");
+            baseDestination.setProofStrategy(ProofStrategy.PROVE_NONE);
+            dataDestination.setProofStrategy(ProofStrategy.PROVE_NONE);
+        } else {
+            log.info("Reticulum mesh was not started — closing worker threads only");
+        }
 
         if (this.rnsBaseThread != null && this.rnsBaseThread.isAlive()) {
             this.rnsBaseThread.interrupt();
@@ -948,16 +964,21 @@ public class RNS {
             }
         }
         
-        // gracefully close links of peers that point to us
-        for (ReticulumPeer p: incomingPeers) {
+        // gracefully close links of peers that point to us.
+        // Iterate the immutable snapshots, not the live synchronized lists: a concurrent
+        // add/remove during shutdown would otherwise throw ConcurrentModificationException here
+        // and skip the rest of the shutdown (executors, exitHandler).
+        for (ReticulumPeer p: getImmutableIncomingPeers()) {
             var pl = p.getPeerLink();
-            if (nonNull(pl) & (pl.getStatus() == ACTIVE)) {
+            // && (not &): the status read must not happen when the link is null, or shutdown
+            // dies on an NPE before it can stop the executors and run exitHandler().
+            if (nonNull(pl) && (pl.getStatus() == ACTIVE)) {
                 p.sendCloseToRemote(pl);
             }
         }
         log.debug("Shutdown of incomingPeers completed");
         // Disconnect peers gracefully and terminate Reticulum
-        for (ReticulumPeer p: linkedPeers) {
+        for (ReticulumPeer p: getImmutableLinkedPeers()) {
             log.info("shutting down peer: {}", encodeHexString(p.getDestinationHash()));
             p.shutdown();
         }
@@ -985,6 +1006,10 @@ public class RNS {
             this.reconnectExecutor.shutdownNow();
             this.dataAnnounceExecutor.shutdownNow();
             this.dataReconnectExecutor.shutdownNow();
+        }
+
+        if (!meshWasStarted) {
+            return;
         }
 
         // exitHandler() can block indefinitely if a zombie link's channel holds a lock
@@ -1322,6 +1347,12 @@ public class RNS {
 
         // Cooldown: skip if we've considered this endpoint recently.
         Instant now = Instant.now();
+        // Evict entries that are past the cooldown: without this the map keeps one entry per
+        // host:port ever announced, for the process lifetime, on a mesh-wide announce stream.
+        // Entries older than the cooldown can no longer suppress anything, so dropping them is
+        // behaviour-neutral.
+        recentGatewayAttempts.values().removeIf(
+                t -> Duration.between(t, now).compareTo(GATEWAY_COOLDOWN) >= 0);
         Instant last = recentGatewayAttempts.get(endpoint);
         if (last != null && Duration.between(last, now).compareTo(GATEWAY_COOLDOWN) < 0) {
             return; // silently — this is the steady-state path on repeated announces
@@ -1575,7 +1606,10 @@ public class RNS {
     }
 
     public List<ReticulumPeer> getActiveImmutableLinkedPeers() {
-        List<ReticulumPeer> activePeers = Collections.synchronizedList(new ArrayList<>());
+        // Plain ArrayList: this is a private snapshot returned to a single caller, never shared.
+        // The old Collections.synchronizedList wrapper implied a thread-safety contract that the
+        // snapshot does not need, on a value allocated ~200 times/second by the two loops.
+        List<ReticulumPeer> activePeers = new ArrayList<>();
         for (ReticulumPeer p: this.immutableLinkedPeers) {
             // Exclude peers marked for removal (deleteMe=true): their buffer is dead even if
             // the library-level link is still ACTIVE. Excluding them lets runBaseLoop() see
@@ -1649,8 +1683,16 @@ public class RNS {
         // it themselves, passing the exact Link they decided on (see prunePeers) — closing here
         // would both re-read a peerLink that initPeerLink() may have re-pointed at a fresh Link,
         // and close PENDING links, which triggers the expirePath() cull cascade documented below.
-        this.linkedPeers.remove(peer); // single synchronized operation on the list
-        this.immutableLinkedPeers = List.copyOf(this.linkedPeers);
+        //
+        // Mutation and snapshot rebuild must happen under the same lock addLinkedPeer() holds.
+        // Otherwise: this thread reads the backing list, an adder (holding the lock) adds a peer
+        // and publishes snapshot {P2}, then this thread publishes its stale snapshot {} — the new
+        // peer is in linkedPeers but invisible in immutableLinkedPeers until the next mutation,
+        // and every consumer (broadcast, runBaseLoop, prunePeers, findPeerBy*) reads the snapshot.
+        synchronized (this.linkedPeers) {
+            this.linkedPeers.remove(peer);
+            this.immutableLinkedPeers = List.copyOf(this.linkedPeers);
+        }
         // Remove from Network's connected/handshaked lists on EVERY removal path. This was
         // previously commented out (and only some callers, e.g. prunePeers, called
         // makePeerUnavailable() explicitly first) — so removal paths that didn't, like
@@ -1792,8 +1834,11 @@ public class RNS {
         // built fresh per Link (baseClientConnected/dataClientConnected) and never re-initiated, so
         // reading peerLink here cannot pick up a replacement. Only ACTIVE: see removeLinkedPeer.
         closeIfActive(peer);
-        this.incomingPeers.remove(peer); // single synchronized operation on the list
-        this.immutableIncomingPeers = List.copyOf(this.incomingPeers);
+        // Same lock as addIncomingPeer() — see removeLinkedPeer() for the stale-snapshot race.
+        synchronized (this.incomingPeers) {
+            this.incomingPeers.remove(peer);
+            this.immutableIncomingPeers = List.copyOf(this.incomingPeers);
+        }
         // Incoming BASE peers are also registered in Network's connected/handshaked lists via
         // makePeerAvailable(); remove them here so they don't leak (see removeLinkedPeer).
         peer.makePeerUnavailable();
@@ -1820,12 +1865,18 @@ public class RNS {
         return false;
     }
 
+    /**
+     * Incoming peers whose link is missing or not ACTIVE.
+     * <p>
+     * Iterates the immutable snapshot: for-each over the live {@code Collections.synchronizedList}
+     * without holding its monitor throws ConcurrentModificationException as soon as
+     * addIncomingPeer()/removeIncomingPeer() runs concurrently, and prunePeers() calls this three
+     * times per cycle. The returned list is a private snapshot, so it needs no synchronized wrapper.
+     */
     public List<ReticulumPeer> getNonActiveIncomingPeers() {
-        var ips = this.incomingPeers;
-        List<ReticulumPeer> result = Collections.synchronizedList(new ArrayList<>());
-        Link pl;
-        for (ReticulumPeer p: ips) {
-            pl = p.getPeerLink();
+        List<ReticulumPeer> result = new ArrayList<>();
+        for (ReticulumPeer p: getImmutableIncomingPeers()) {
+            Link pl = p.getPeerLink();
             if (nonNull(pl)) {
                 if (pl.getStatus() != ACTIVE) {
                     result.add(p);
