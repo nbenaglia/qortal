@@ -1,4 +1,4 @@
-package org.qortal.test.network;
+package org.qortal.test.network.reticulum;
 
 import org.junit.jupiter.api.Test;
 import org.qortal.network.reticulum.RNSAnnounceCodec;

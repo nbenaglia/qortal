@@ -1,4 +1,4 @@
-package org.qortal.test.network;
+package org.qortal.test.network.reticulum;
 
 import org.apache.commons.lang3.StringUtils;
 //import org.junit.Before;

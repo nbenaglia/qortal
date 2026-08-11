@@ -17,22 +17,17 @@ import static io.reticulum.link.LinkStatus.ACTIVE;
 import static io.reticulum.link.LinkStatus.CLOSED;
 import static io.reticulum.link.LinkStatus.PENDING;
 import static io.reticulum.utils.DestinationUtils.hashFromNameAndIdentity;
-import static io.reticulum.constant.ReticulumConstant.CONFIG_FILE_NAME;
 import lombok.Getter;
 import lombok.Synchronized;
 
-import org.apache.commons.lang3.StringUtils;
 import org.qortal.network.Peer;
 import org.qortal.network.message.*;
 import org.qortal.repository.DataException;
 import org.qortal.settings.Settings;
 
-import java.io.BufferedReader;
 import java.io.IOException;
-import java.io.InputStreamReader;
 import java.net.InetAddress;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.StandardCopyOption;
 import static java.nio.file.StandardOpenOption.CREATE;
 import static java.nio.file.StandardOpenOption.WRITE;
 import java.nio.file.Files;
@@ -41,7 +36,6 @@ import java.nio.file.Path;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static java.util.Objects.nonNull;
 
-import java.io.File;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.function.Function;
@@ -60,9 +54,6 @@ import org.qortal.controller.Controller;
 // logging
 import lombok.extern.slf4j.Slf4j;
 
-// templates
-import com.hubspot.jinjava.Jinjava;
-import com.google.common.collect.Maps;
 
 @Slf4j
 public class RNS {
@@ -85,15 +76,13 @@ public class RNS {
     @Getter private volatile boolean isShuttingDown = false;
     private volatile boolean meshStarted = false;   // exported via isMeshStarted()
 
-    // Confirmed-active peer destination hashes — only added when a peer's buffer is successfully
-    // created (ACTIVE confirmed). Persisted to disk on shutdown so the next restart reconnects
-    // immediately without waiting for announces. Never includes transient/failed-only peers.
-    private final Set<String> knownPeerHashes = Collections.synchronizedSet(new HashSet<>());
-    // Hashes loaded from disk on startup (may include stale entries from previous sessions).
-    // Used alongside knownPeerHashes for path recovery. Not saved back directly; knownPeerHashes
-    // (confirmed this session) is saved instead, which naturally drops stale entries over time.
-    private final Set<String> loadedPeerHashes = Collections.synchronizedSet(new HashSet<>());
+    // Persisted destination hashes of peers we have talked to, one store per aspect, so a restart
+    // reconnects immediately instead of waiting for announces. See KnownPeerStore for why the
+    // confirmed and loaded sets are kept apart. Created in start(), once the storage path is known.
     private static final String KNOWN_PEERS_FILE = "known_peer_hashes.txt";
+    private static final String KNOWN_DATA_PEERS_FILE = "known_data_peer_hashes.txt";
+    private KnownPeerStore basePeerStore;
+    private KnownPeerStore dataPeerStore;
 
     // Tracks hashes of peers whose PENDING links were pruned as stuck (>60 s without establishing).
     // When a peer is unreachable, createLinkedPeerFromIdentity() creates a PENDING link that the
@@ -214,10 +203,6 @@ public class RNS {
     private volatile java.util.concurrent.Future<?> dataAnnounceTaskFuture  = null;
     private volatile java.util.concurrent.Future<?> dataReconnectTaskFuture = null;
 
-    // Persisted DATA peer hashes — same semantics as knownPeerHashes / loadedPeerHashes for BASE
-    private static final String KNOWN_DATA_PEERS_FILE = "known_data_peer_hashes.txt";
-    private final Set<String> knownDataPeerHashes  = Collections.synchronizedSet(new HashSet<>());
-    private final Set<String> loadedDataPeerHashes = Collections.synchronizedSet(new HashSet<>());
     private final java.util.concurrent.ConcurrentHashMap<String, Long> pendingDataLinkFailureMs =
             new java.util.concurrent.ConcurrentHashMap<>();
 
@@ -282,7 +267,7 @@ public class RNS {
         log.info("RNS constructor");
         try {
             log.info("creating config in {}", defaultConfigPath);
-            initConfig(defaultConfigPath);
+            RNSConfigWriter.ensureConfig(defaultConfigPath, APP_NAME, TARGET_PORT);
             reticulum = new Reticulum(defaultConfigPath);
             var identitiesPath = reticulum.getStoragePath().resolve("identities");
             if (Files.notExists(identitiesPath)) {
@@ -382,8 +367,10 @@ public class RNS {
         Transport.getInstance().registerAnnounceHandler(new QAnnounceHandler(QDN_ASPECT));
         log.debug("announceHandlers: {}", Transport.getInstance().getAnnounceHandlers());
         // Load peer hashes persisted from previous run so we can call requestPath() fast on restart.
-        loadKnownPeerHashes();
-        loadKnownDataPeerHashes();
+        this.basePeerStore = new KnownPeerStore(reticulum.getStoragePath(), KNOWN_PEERS_FILE, "BASE");
+        this.dataPeerStore = new KnownPeerStore(reticulum.getStoragePath(), KNOWN_DATA_PEERS_FILE, "DATA");
+        this.basePeerStore.load();
+        this.dataPeerStore.load();
         // do a first announce (across all configured interfaces)
         byte[] initialAppData = buildAnnounceAppData();
         baseDestination.announce(initialAppData);
@@ -392,12 +379,12 @@ public class RNS {
         log.info("Sent initial announce from {} ({})", encodeHexString(dataDestination.getHash()), dataDestination.getName());
         // Seed loop announce timers. On restart (non-empty loaded hashes) fire path requests
         // at t=15s; on first-ever start use the full 30s window.
-        this.lastBaseLoopAnnounceMs = loadedPeerHashes.isEmpty()
-                ? System.currentTimeMillis()
-                : System.currentTimeMillis() - BASE_LOOP_ANNOUNCE_INTERVAL_MS + 15_000L;
-        this.lastDataLoopAnnounceMs = loadedDataPeerHashes.isEmpty()
-                ? System.currentTimeMillis()
-                : System.currentTimeMillis() - DATA_LOOP_ANNOUNCE_INTERVAL_MS + 15_000L;
+        this.lastBaseLoopAnnounceMs = this.basePeerStore.hasLoadedHashes()
+                ? System.currentTimeMillis() - BASE_LOOP_ANNOUNCE_INTERVAL_MS + 15_000L
+                : System.currentTimeMillis();
+        this.lastDataLoopAnnounceMs = this.dataPeerStore.hasLoadedHashes()
+                ? System.currentTimeMillis() - DATA_LOOP_ANNOUNCE_INTERVAL_MS + 15_000L
+                : System.currentTimeMillis();
 
         // Start up "main" threads, one per destination / peer aspect.
         this.rnsBaseThread = new Thread(this::runBaseLoop, "rnsMesh-BASE");
@@ -413,78 +400,6 @@ public class RNS {
 
     public boolean isMeshStarted() {
         return meshStarted;
-    }
-
-    private void initConfig(String configDir) throws IOException {
-        File configDir1 = new File(configDir);
-        if (!configDir1.exists()) {
-            configDir1.mkdir();
-        }
-        var configPath = Path.of(configDir1.getAbsolutePath());
-        Path configFile = configPath.resolve(CONFIG_FILE_NAME);
-        var localhost = InetAddress.getLocalHost();
-        var fqdn = localhost.getCanonicalHostName();
-        var isReticulumGateway = Settings.getInstance().getReticulumIsGateway();
-        var reticulumDesiredClientInterfaces =  Settings.getInstance().getReticulumDesiredClientInterfaces();
-        var reticulumTcpGatewayServers = Arrays.stream(Settings.getInstance().getReticulumTcpGatewayServers()).collect(Collectors.toList());
-        var reticulumBackboneGatewayServers = Arrays.stream(Settings.getInstance().getReticulumBackboneGatewayServers()).collect(Collectors.toList());
-        reticulumTcpGatewayServers.remove(fqdn);
-        reticulumBackboneGatewayServers.remove(fqdn);
-        Map<String, Object> context = Maps.newHashMap();
-
-        if (Files.notExists(configFile) || Settings.getInstance().isReticulumRegenerateConfigOnRestart()) {
-            try {
-                // jinjava variables set in context:
-                // * tcp_gateway_servers: list of nodes with a TCPServerInterface
-                // * tcp_backbone_servers: list of nodes with a BackboneServerInterface
-                // * num_client_interfaces: number of client interfaces to gateways be configured
-                // * host_fqdn: host FQDN
-                // * qortal_network_name: either "qortal" or "qortaltest" (from isTestnet)
-                // * is_reticulum_gateway: one of the instances (Qortal core or RNS) has
-                //                         at least one Gateway interface
-                // * is_test_net: String "true" or "false" (from isTestNet)
-                // * target_port: target port for TCPServerInterface or BackboneServerInterface (only)
-                // * use_python_rns: use local shared python rnsd (has to provide a gateway interface)
-                // * python_rns_if_port: rnsd TCPServerInterface port (if rnsd gateway is a TCPServerInterface)
-                var jnj = new Jinjava();
-                var reticulumTcpGateways = StringUtils.join(reticulumTcpGatewayServers, " ");
-                var reticulumBackboneGateways = StringUtils.join(reticulumBackboneGatewayServers, " ");
-                log.info("reticulumTcpGateways: {}, reticulumBackboneGateways", reticulumTcpGateways);
-                context.put("tcp_gateway_servers",  reticulumTcpGateways);
-                context.put("backbone_gateway_servers",  reticulumBackboneGateways);
-                context.put("num_client_interfaces", reticulumDesiredClientInterfaces);
-                context.put("host_fqdn", fqdn);
-                String networkName = Settings.getInstance().getReticulumNetworkName();
-                context.put("qortal_network_name", networkName.isEmpty() ? APP_NAME : networkName);
-                context.put("target_port", TARGET_PORT);
-                context.put("is_reticulum_gateway", isReticulumGateway ? "true" : "false");
-                context.put("use_python_rns", Settings.getInstance().getReticulumUsePythonRNS() ? "true" : "false");
-                context.put("python_rns_if_port", Settings.getInstance().getReticulumPythonRNSGatewayPort());
-                context.put("passphrase", Settings.getInstance().getReticulumPassphrase());
-
-                // render config.yml from template
-                log.info("Rendering new Reticulum configuration file from resource {}", RNSCommon.jinjaConfigTemplateName  );
-                var templateResourceInpuSteam = this.getClass().getClassLoader().getResourceAsStream(RNSCommon.jinjaConfigTemplateName);
-                var template = new BufferedReader(new InputStreamReader(templateResourceInpuSteam)).lines().parallel().collect(Collectors.joining("\n"));
-                var renderedConfig = jnj.render(template, context);
-                // Delete any existing config first. Files.write(CREATE, WRITE) does NOT truncate, so
-                // regenerating a SHORTER config (e.g. after lowering reticulumDesiredClientInterfaces)
-                // left the old file's trailing bytes in place — a stale/duplicated interface, and
-                // sometimes a corrupt tail. Deleting guarantees the rendered file is exactly the new
-                // content. (The fallback path below already uses Files.copy REPLACE_EXISTING.)
-                Files.deleteIfExists(configFile);
-                Files.write(configFile, renderedConfig.getBytes(), CREATE, WRITE);
-            } catch (Exception e) {
-                log.error("Failed to render config file - creating fallback default  config file", e);
-                var defaultConfig = this.getClass().getClassLoader().getResourceAsStream(RNSCommon.defaultRNSConfig);
-                if (Settings.getInstance().isTestNet()) {
-                    defaultConfig = this.getClass().getClassLoader().getResourceAsStream(RNSCommon.defaultRNSConfigTestnet);
-                }
-                Files.copy(defaultConfig, configFile, StandardCopyOption.REPLACE_EXISTING);
-            }
-        } else {
-            log.debug("Reticulum config exists, skipping.");
-        }
     }
 
     // "main" loop for baseDestination (chain tasks)
@@ -611,8 +526,7 @@ public class RNS {
                         reconnectTaskStartedMs = nowMs;
                         final int activeLinked = getActiveImmutableLinkedPeers().size();
                         final List<ReticulumPeer> currentLinked = getImmutableLinkedPeers();
-                        final Set<String> reconnectTargets = new HashSet<>(knownPeerHashes);
-                        reconnectTargets.addAll(loadedPeerHashes);
+                        final Set<String> reconnectTargets = basePeerStore.reconnectTargets();
                         try {
                             reconnectTaskFuture = reconnectExecutor.submit(() -> {
                                 Thread.interrupted(); // clear any stale interrupt flag from prior cancel
@@ -831,8 +745,7 @@ public class RNS {
                         final List<ReticulumPeer> currentDataLinked = getImmutableLinkedPeers().stream()
                                 .filter(p -> p.getPeerAspect() == RNSCommon.PeerAspect.DATA)
                                 .collect(Collectors.toList());
-                        final Set<String> dataTargets = new HashSet<>(knownDataPeerHashes);
-                        dataTargets.addAll(loadedDataPeerHashes);
+                        final Set<String> dataTargets = dataPeerStore.reconnectTargets();
                         try {
                             dataReconnectTaskFuture = dataReconnectExecutor.submit(() -> {
                                 Thread.interrupted();
@@ -924,8 +837,8 @@ public class RNS {
         // the executors were still created by the constructor and must be closed either way.
         boolean meshWasStarted = reticulum != null && baseDestination != null;
         if (meshWasStarted) {
-            saveKnownPeerHashes();
-            saveKnownDataPeerHashes();
+            basePeerStore.save();
+            dataPeerStore.save();
             log.info("shutting down Reticulum");
             baseDestination.setProofStrategy(ProofStrategy.PROVE_NONE);
             dataDestination.setProofStrategy(ProofStrategy.PROVE_NONE);
@@ -1913,98 +1826,15 @@ public class RNS {
         }
     }
 
-    /**
-     * Persist known peer destination hashes so a restarted node can call requestPath()
-     * immediately rather than waiting up to 15 minutes for a natural announce.
-     */
-    private void saveKnownPeerHashes() {
-        if (reticulum == null) return;
-        try {
-            Path file = reticulum.getStoragePath().resolve(KNOWN_PEERS_FILE);
-            // Prefer confirmed-active hashes; fall back to loaded hashes only if nothing was
-            // confirmed this session (e.g., very short startup before any peer became ACTIVE).
-            Set<String> toSave = knownPeerHashes.isEmpty() ? loadedPeerHashes : knownPeerHashes;
-            Files.write(file, toSave, UTF_8);
-            log.debug("Saved {} known peer hashes to {}", toSave.size(), file);
-        } catch (IOException e) {
-            log.warn("Failed to save known peer hashes: {}", e.getMessage());
-        }
-    }
-
     // Called from ReticulumPeer.createPeerBuffer() when a peer's buffer is confirmed ACTIVE.
     // Only initiator peers call this (non-initiators have our own destination hash, not the remote's).
     void confirmPeerHash(String hashHex, RNSCommon.PeerAspect aspect) {
         // Peer is ACTIVE — clear any failure/backoff state so a future transient drop starts fresh
         // rather than inheriting a long exponential-backoff window from earlier.
         clearPendingFailure(hashHex);
-        if (aspect == RNSCommon.PeerAspect.DATA) {
-            boolean isNew = this.knownDataPeerHashes.add(hashHex);
-            if (isNew) {
-                saveKnownDataPeerHashes();
-                log.debug("Confirmed ACTIVE DATA peer hash {}", hashHex);
-            }
-        } else {
-            boolean isNew = this.knownPeerHashes.add(hashHex);
-            if (isNew) {
-                saveKnownPeerHashes();
-                log.debug("Confirmed ACTIVE peer hash {}", hashHex);
-            }
-        }
-    }
-
-    private void loadKnownPeerHashes() {
-        if (reticulum == null) return;
-        try {
-            Path file = reticulum.getStoragePath().resolve(KNOWN_PEERS_FILE);
-            if (!Files.isReadable(file)) return;
-            List<String> lines = Files.readAllLines(file, UTF_8);
-            int loaded = 0;
-            for (String line : lines) {
-                String hex = line.trim();
-                if (!hex.isEmpty()) {
-                    loadedPeerHashes.add(hex); // loaded into separate set; confirmed-active entries go to knownPeerHashes
-                    loaded++;
-                }
-            }
-            if (loaded > 0) {
-                log.info("Loaded {} known peer hashes from {}", loaded, file);
-            }
-        } catch (IOException e) {
-            log.warn("Failed to load known peer hashes: {}", e.getMessage());
-        }
-    }
-
-    private void saveKnownDataPeerHashes() {
-        if (reticulum == null) return;
-        try {
-            Path file = reticulum.getStoragePath().resolve(KNOWN_DATA_PEERS_FILE);
-            Set<String> toSave = knownDataPeerHashes.isEmpty() ? loadedDataPeerHashes : knownDataPeerHashes;
-            Files.write(file, toSave, UTF_8);
-            log.debug("Saved {} known DATA peer hashes to {}", toSave.size(), file);
-        } catch (IOException e) {
-            log.warn("Failed to save known DATA peer hashes: {}", e.getMessage());
-        }
-    }
-
-    private void loadKnownDataPeerHashes() {
-        if (reticulum == null) return;
-        try {
-            Path file = reticulum.getStoragePath().resolve(KNOWN_DATA_PEERS_FILE);
-            if (!Files.isReadable(file)) return;
-            List<String> lines = Files.readAllLines(file, UTF_8);
-            int loaded = 0;
-            for (String line : lines) {
-                String hex = line.trim();
-                if (!hex.isEmpty()) {
-                    loadedDataPeerHashes.add(hex);
-                    loaded++;
-                }
-            }
-            if (loaded > 0) {
-                log.info("Loaded {} known DATA peer hashes from {}", loaded, file);
-            }
-        } catch (IOException e) {
-            log.warn("Failed to load known DATA peer hashes: {}", e.getMessage());
+        KnownPeerStore store = (aspect == RNSCommon.PeerAspect.DATA) ? dataPeerStore : basePeerStore;
+        if (store != null) {   // null until start() has run
+            store.confirm(hashHex);
         }
     }
 
