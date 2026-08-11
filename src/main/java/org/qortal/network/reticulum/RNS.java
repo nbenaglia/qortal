@@ -45,10 +45,8 @@ import java.io.File;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.function.Function;
-import java.nio.ByteBuffer;
 import java.time.Duration;
 import java.time.Instant;
-import java.util.regex.Matcher;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -132,19 +130,11 @@ public class RNS {
     // appData payload on each announce; peers receiving the announce can then
     // dynamically add a BackboneClientInterface to discover gateways without
     // every node needing them hardcoded in settings.
-    private static final byte[] GW_APPDATA_MAGIC = { 'Q', 'G', 'W', '1' };
-    private static final int GW_APPDATA_MIN_LEN = GW_APPDATA_MAGIC.length + 1 /*hostLen*/ + 2 /*port*/;
+    // The payload itself (QAN1 container, legacy QGW1 fallback) lives in RNSAnnounceCodec.
     private static final Duration GATEWAY_COOLDOWN = Duration.ofMinutes(10);
     /** host:port → last time we considered adding (success or skip), to throttle churn. */
     private final Map<String, Instant> recentGatewayAttempts = new ConcurrentHashMap<>();
 
-    // ── Announce appData container (QAN1) ────────────────────────────────────
-    // Self-describing TLV payload attached to every announce. Always carries the node's version;
-    // optionally carries a gateway record (superseding the old QGW1-only payload). Extensible:
-    // future capability records simply add new type bytes. Decode falls back to legacy QGW1.
-    private static final byte[] QAN_APPDATA_MAGIC = { 'Q', 'A', 'N', '1' };
-    private static final byte QAN_TLV_VERSION = 0x01; // value = UTF-8 version string (no "qortal-" prefix)
-    private static final byte QAN_TLV_GATEWAY = 0x02; // value = [hostLen:1][host][port:2] (legacy QGW1 body)
     /** Announced version keyed by identity hash (hex). Lets incoming peers (which have no announce
      *  at construction) resolve their version once they identify. Bounded LRU to avoid unbounded
      *  growth from mesh-wide announces. */
@@ -1062,84 +1052,30 @@ public class RNS {
     // ── reticulumAnnounceGateway: send / receive / dispatch ──────────────────
 
     /**
-     * Build the appData attached to every announce: a QAN1 TLV container carrying this node's
-     * version (always) and, when this node advertises a gateway, a gateway record. Never returns
-     * null — the version always makes it worth sending. Extensible for future capability records.
+     * Build the appData attached to every announce: this node's version, plus a gateway record when
+     * this node advertises one. Encoding lives in {@link RNSAnnounceCodec}; the policy decision of
+     * <i>whether</i> to advertise stays here, with the settings it depends on.
      */
     private byte[] buildAnnounceAppData() {
-        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
-        out.write(QAN_APPDATA_MAGIC, 0, QAN_APPDATA_MAGIC.length);
-
-        // VERSION record (always). e.g. "6.1.9-71cfe5b"
-        byte[] ver = Controller.getInstance().getVersionStringWithoutPrefix().getBytes(StandardCharsets.UTF_8);
-        if (ver.length > 255) ver = Arrays.copyOf(ver, 255);
-        out.write(QAN_TLV_VERSION);
-        out.write(ver.length);
-        out.write(ver, 0, ver.length);
-
-        // GATEWAY record (only when advertising a gateway)
-        byte[] gw = buildGatewayValue();
-        if (gw != null) {
-            out.write(QAN_TLV_GATEWAY);
-            out.write(gw.length);
-            out.write(gw, 0, gw.length);
-        }
-        return out.toByteArray();
+        return RNSAnnounceCodec.encode(
+                Controller.getInstance().getVersionStringWithoutPrefix(),
+                gatewayHostToAdvertise(),
+                TARGET_PORT);
     }
 
-    /**
-     * The gateway record's VALUE bytes: {@code [hostLen:1][host][port:2]}, or {@code null} when
-     * this node is not advertising a gateway or the host is unusable. Same body layout as the
-     * legacy QGW1 payload (minus its magic), so {@link #decodeGatewayAppData} still parses old peers.
-     */
-    private byte[] buildGatewayValue() {
+    /** The gateway host to put in our announces, or null when this node advertises no gateway. */
+    private String gatewayHostToAdvertise() {
         if (!Settings.getInstance().getReticulumAnnounceGateway()) return null;
         if (!Settings.getInstance().getReticulumIsGateway())       return null;
 
         String host = getAdvertiseHost();
-        if (host == null || host.isEmpty()) return null;
-
-        byte[] hostBytes = host.getBytes(StandardCharsets.UTF_8);
-        // +1 (hostLen) +2 (port) must fit a single-byte TLV length (<=255)
-        if (hostBytes.length < 1 || hostBytes.length > 252) {
-            log.warn("Skipping gateway appData: host '{}' encoded length {} not in 1..252",
-                    host, hostBytes.length);
+        // The codec drops a host it cannot encode; say so, or the gateway would silently never be
+        // advertised. +1 (hostLen) +2 (port) must fit a single-byte TLV length.
+        if (host != null && host.getBytes(StandardCharsets.UTF_8).length > 252) {
+            log.warn("Skipping gateway appData: host '{}' is too long to encode (max 252 bytes)", host);
             return null;
         }
-        int port = TARGET_PORT;
-        if (port < 1 || port > 0xFFFF) return null;
-
-        ByteBuffer buf = ByteBuffer.allocate(1 + hostBytes.length + 2);
-        buf.put((byte) hostBytes.length);
-        buf.put(hostBytes);
-        buf.putShort((short) port);
-        return buf.array();
-    }
-
-    /**
-     * Whether a host string is suitable to advertise as a gateway or to dial
-     * as a dynamically-announced gateway. Rejects:
-     *   - null/empty
-     *   - "localhost" (case-insensitive)
-     *   - loopback IPv4 (127.x.x.x) and IPv6 (::1)
-     *   - bare single-label names with no dot — not an FQDN, not resolvable
-     *     for arbitrary peers
-     * The check is best-effort: we cannot tell from inside the process whether
-     * a name actually resolves for any given peer, only catch the obvious cases
-     * that the auto-detection commonly produces on desktops, VMs and NAT'd hosts.
-     */
-    private static boolean isUsableAdvertiseHost(String host) {
-        if (host == null) return false;
-        String h = host.trim();
-        if (h.isEmpty()) return false;
-        if (h.equalsIgnoreCase("localhost")) return false;
-        if (h.startsWith("127.")) return false;
-        if (h.equals("::1")) return false;
-        // Require at least one dot. Catches "dev-vm-2-desktop" and similar
-        // local hostnames; both real FQDNs and IPv4/IPv6 literals have dots
-        // (or colons — we accept ':' too for raw IPv6, though that is unusual).
-        if (h.indexOf('.') < 0 && h.indexOf(':') < 0) return false;
-        return true;
+        return host;
     }
 
     /**
@@ -1161,7 +1097,7 @@ public class RNS {
                 source = "reticulumAnnouncedHost setting";
             } else {
                 String detected = getLocalFqdn();
-                if (isUsableAdvertiseHost(detected)) {
+                if (RNSAnnounceCodec.isUsableAdvertiseHost(detected)) {
                     chosen = detected;
                     source = "auto-detected FQDN";
                 } else {
@@ -1182,100 +1118,6 @@ public class RNS {
             advertiseHostResolved = true;
             return chosen;
         }
-    }
-
-    /**
-     * Decode gateway info from an announce's appData. Returns {@code null} if
-     * the payload doesn't start with our magic, is malformed, or carries
-     * out-of-range values. Returning null is always safe — caller skips.
-     *
-     * @return {@code new String[] {host, portStr}} on success, else {@code null}
-     */
-    private static String[] decodeGatewayAppData(byte[] appData) {
-        if (appData == null || appData.length < GW_APPDATA_MIN_LEN) return null;
-        for (int i = 0; i < GW_APPDATA_MAGIC.length; i++) {
-            if (appData[i] != GW_APPDATA_MAGIC[i]) return null;
-        }
-        int hostLen = appData[GW_APPDATA_MAGIC.length] & 0xFF;
-        int hostStart = GW_APPDATA_MAGIC.length + 1;
-        if (hostLen < 1 || appData.length < hostStart + hostLen + 2) return null;
-        String host;
-        try {
-            host = new String(appData, hostStart, hostLen, StandardCharsets.UTF_8);
-        } catch (Exception e) {
-            return null;
-        }
-        int port = ((appData[hostStart + hostLen] & 0xFF) << 8)
-                 | (appData[hostStart + hostLen + 1] & 0xFF);
-        if (port < 1 || port > 0xFFFF) return null;
-        return new String[] { host, String.valueOf(port) };
-    }
-
-    /** Decoded announce appData: any field may be absent (version null, gwPort 0). */
-    private static final class AnnounceInfo {
-        String version;
-        String gwHost;
-        int gwPort;
-    }
-
-    /**
-     * Decode a QAN1 announce appData container into its fields. Robust to malformed/truncated
-     * records (stops parsing). Falls back to the legacy QGW1 gateway-only payload when the QAN1
-     * magic is absent, so announces from older peers still yield gateway info (version stays null).
-     */
-    private static AnnounceInfo decodeAnnounceAppData(byte[] appData) {
-        AnnounceInfo info = new AnnounceInfo();
-        boolean isQan = appData != null && appData.length >= QAN_APPDATA_MAGIC.length;
-        if (isQan) {
-            for (int i = 0; i < QAN_APPDATA_MAGIC.length; i++) {
-                if (appData[i] != QAN_APPDATA_MAGIC[i]) { isQan = false; break; }
-            }
-        }
-        if (!isQan) {
-            String[] gw = decodeGatewayAppData(appData); // legacy QGW1
-            if (gw != null) { info.gwHost = gw[0]; info.gwPort = Integer.parseInt(gw[1]); }
-            return info;
-        }
-        int p = QAN_APPDATA_MAGIC.length;
-        while (p + 2 <= appData.length) {
-            int type = appData[p] & 0xFF;
-            int len = appData[p + 1] & 0xFF;
-            int vStart = p + 2;
-            if (vStart + len > appData.length) break; // truncated record
-            if (type == QAN_TLV_VERSION) {
-                try { info.version = new String(appData, vStart, len, StandardCharsets.UTF_8); }
-                catch (Exception ignored) { }
-            } else if (type == QAN_TLV_GATEWAY && len >= 3) {
-                int hl = appData[vStart] & 0xFF;
-                if (1 + hl + 2 <= len) {
-                    try { info.gwHost = new String(appData, vStart + 1, hl, StandardCharsets.UTF_8); }
-                    catch (Exception ignored) { }
-                    int port = ((appData[vStart + 1 + hl] & 0xFF) << 8) | (appData[vStart + 2 + hl] & 0xFF);
-                    if (port >= 1 && port <= 0xFFFF) info.gwPort = port;
-                }
-            }
-            p = vStart + len; // skip unknown types too
-        }
-        return info;
-    }
-
-    /**
-     * Parse "x.y.z[-hash]" (with or without the "qortal-" prefix) to the 3-short packed long used
-     * for min-version comparison (same scheme as IPPeer). Returns 0 if unparseable.
-     */
-    static long parseVersionToLong(String versionString) {
-        if (versionString == null) return 0L;
-        String s = versionString.startsWith(Controller.VERSION_PREFIX)
-                ? versionString : Controller.VERSION_PREFIX + versionString;
-        Matcher m = ReticulumPeer.VERSION_PATTERN.matcher(s);
-        if (!m.lookingAt()) return 0L;
-        long v = 0;
-        for (int g = 1; g <= 3; g++) {
-            long value = Long.parseLong(m.group(g));
-            if (value < 0 || value > Short.MAX_VALUE) return 0L;
-            v = (v << 16) | value;
-        }
-        return v;
     }
 
     /** Record a peer's announced version, keyed by identity hash, for later lookup by incoming peers. */
@@ -1327,7 +1169,7 @@ public class RNS {
         // names). Without this guard, a sender whose auto-detected FQDN was bad
         // would have every receiver pointlessly try to dial 127.0.0.1, its own
         // hostname, etc.
-        if (!isUsableAdvertiseHost(host)) {
+        if (!RNSAnnounceCodec.isUsableAdvertiseHost(host)) {
             log.debug("Gateway announce: dropping unusable host '{}' (likely misconfigured peer)", host);
             return;
         }
@@ -1456,12 +1298,12 @@ public class RNS {
 
             String announcedVersion = null;
             if (nonNull(appData)) {
-                AnnounceInfo info = decodeAnnounceAppData(appData);
-                announcedVersion = info.version;
+                RNSAnnounceCodec.AnnounceInfo info = RNSAnnounceCodec.decode(appData);
+                announcedVersion = info.getVersion();
                 // If the announce advertises a Qortal gateway, optionally dial it as a dynamic
                 // backbone client interface.
-                if (info.gwHost != null && info.gwPort > 0) {
-                    maybeAddDynamicGateway(info.gwHost, info.gwPort);
+                if (info.hasGateway()) {
+                    maybeAddDynamicGateway(info.getGatewayHost(), info.getGatewayPort());
                 }
                 // Cache the announced version so incoming peers (no announce at construction) can
                 // resolve it once they identify.
@@ -1474,8 +1316,8 @@ public class RNS {
             // minimum (unless the operator allows older peers). Unknown/unparseable versions are
             // NOT skipped — only a known, parseable, below-minimum version is rejected.
             if (announcedVersion != null && !Settings.getInstance().getAllowConnectionsWithOlderPeerVersions()) {
-                long announced = parseVersionToLong(announcedVersion);
-                long minVersion = parseVersionToLong(Settings.getInstance().getMinPeerVersion());
+                long announced = RNSAnnounceCodec.parseVersionToLong(announcedVersion);
+                long minVersion = RNSAnnounceCodec.parseVersionToLong(Settings.getInstance().getMinPeerVersion());
                 if (announced != 0 && minVersion != 0 && announced < minVersion) {
                     log.info("Skipping announce from {} — version {} < minPeerVersion {}",
                             encodeHexString(destinationHash), announcedVersion,
