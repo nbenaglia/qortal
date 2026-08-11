@@ -18,7 +18,7 @@ import static io.reticulum.link.LinkStatus.CLOSED;
 import static io.reticulum.link.LinkStatus.PENDING;
 import static io.reticulum.utils.DestinationUtils.hashFromNameAndIdentity;
 import static io.reticulum.constant.ReticulumConstant.CONFIG_FILE_NAME;
-import lombok.Data;
+import lombok.Getter;
 import lombok.Synchronized;
 
 import org.apache.commons.lang3.StringUtils;
@@ -66,11 +66,10 @@ import lombok.extern.slf4j.Slf4j;
 import com.hubspot.jinjava.Jinjava;
 import com.google.common.collect.Maps;
 
-@Data
 @Slf4j
 public class RNS {
 
-    Reticulum reticulum;
+    private Reticulum reticulum;
     static final String APP_NAME = Settings.getInstance().isTestNet() ? RNSCommon.TESTNET_APP_NAME: RNSCommon.MAINNET_APP_NAME;
     static final Integer TARGET_PORT = Settings.getInstance().isTestNet() ? RNSCommon.TESTNET_IF_TCP_PORT: RNSCommon.MAINNET_IF_TCP_PORT;
     static final String defaultConfigPath = Settings.getInstance().isTestNet() ? RNSCommon.defaultRNSConfigPathTestnet: RNSCommon.defaultRNSConfigPath;
@@ -79,11 +78,14 @@ public class RNS {
     private final int MIN_DESIRED_CORE_PEERS = Settings.getInstance().getReticulumMinDesiredCorePeers();
     private final int MIN_DESIRED_DATA_PEERS = Settings.getInstance().getReticulumMinDesiredDataPeers();
 
-    public Identity serverIdentity;
-    public Destination baseDestination;
-    public Destination dataDestination;
-    private volatile boolean isShuttingDown = false;
-    private volatile boolean meshStarted = false;
+    // Only the accessors below are exported. This class used to carry Lombok @Data, which
+    // generated ~100 public accessors (including setters for every field and getters handing out
+    // the live peer lists) to serve a handful of real call sites. Everything else is internal.
+    @Getter private Identity serverIdentity;
+    @Getter private Destination baseDestination;
+    @Getter private Destination dataDestination;
+    @Getter private volatile boolean isShuttingDown = false;
+    private volatile boolean meshStarted = false;   // exported via isMeshStarted()
 
     // Confirmed-active peer destination hashes — only added when a peer's buffer is successfully
     // created (ACTIVE confirmed). Persisted to disk on shutdown so the next restart reconnects
@@ -121,9 +123,9 @@ public class RNS {
      *  incomimgPeers are "non-initiators", the passive end of bidirectional Reticulum Buffers.
      */
     private final List<ReticulumPeer> linkedPeers = Collections.synchronizedList(new ArrayList<>());
-    private List<ReticulumPeer> immutableLinkedPeers = Collections.emptyList();
+    @Getter private volatile List<ReticulumPeer> immutableLinkedPeers = Collections.emptyList();
     private final List<ReticulumPeer> incomingPeers = Collections.synchronizedList(new ArrayList<>());
-    private List<ReticulumPeer> immutableIncomingPeers = Collections.emptyList();
+    @Getter private volatile List<ReticulumPeer> immutableIncomingPeers = Collections.emptyList();
 
     // ── Gateway announce (reticulumAnnounceGateway) ──────────────────────────
     // When enabled, the node embeds its own backbone server endpoint as an
@@ -1819,7 +1821,7 @@ public class RNS {
     }
 
     public List<ReticulumPeer> getNonActiveIncomingPeers() {
-        var ips = getIncomingPeers();
+        var ips = this.incomingPeers;
         List<ReticulumPeer> result = Collections.synchronizedList(new ArrayList<>());
         Link pl;
         for (ReticulumPeer p: ips) {
