@@ -100,17 +100,8 @@ public class RNS {
             new ConcurrentHashMap<>();
     private static final long MAX_PENDING_FAILURE_BACKOFF_MS = 30 * 60_000L; // 30 min cap
 
-    /**
-     * Maintain two lists for each subset of peers
-     *  => a synchronizedList, modified when peers are added/removed
-     *  => an immutable List, automatically rebuild to mirror synchronizedList, served to consumers
-     *  linkedPeers are "initiators" (containing initiator reticulum Link), actively doing work.
-     *  incomimgPeers are "non-initiators", the passive end of bidirectional Reticulum Buffers.
-     */
-    private final List<ReticulumPeer> linkedPeers = Collections.synchronizedList(new ArrayList<>());
-    @Getter private volatile List<ReticulumPeer> immutableLinkedPeers = Collections.emptyList();
-    private final List<ReticulumPeer> incomingPeers = Collections.synchronizedList(new ArrayList<>());
-    @Getter private volatile List<ReticulumPeer> immutableIncomingPeers = Collections.emptyList();
+    /** Owns the linked (initiator) and incoming (non-initiator) peer lists and their snapshots. */
+    private final RNSPeerRegistry registry = new RNSPeerRegistry();
 
     // Gateway announce (reticulumAnnounceGateway): advertise-host resolution and dialling of
     // peer-announced gateways live in RNSGatewayManager; the announce payload that carries them
@@ -394,14 +385,8 @@ public class RNS {
                 // non-initiator/incoming peers (incomingPeers) so that requests
                 // received by either side are processed.
                 final List<ReticulumPeer> peersThisRound = Stream.concat(
-                        this.getActiveImmutableLinkedPeers().stream()
-                                .filter(p -> p.getPeerAspect() == RNSCommon.PeerAspect.BASE),
-                        this.getImmutableIncomingPeers().stream()
-                                .filter(p -> p.getPeerAspect() == RNSCommon.PeerAspect.BASE)
-                                .filter(p -> {
-                                    var pl = p.getPeerLink();
-                                    return nonNull(pl) && pl.getStatus() == ACTIVE;
-                                })
+                        registry.activeLinked(RNSCommon.PeerAspect.BASE).stream(),
+                        registry.activeIncoming(RNSCommon.PeerAspect.BASE).stream()
                 ).collect(Collectors.toList());
 
                 final Long now = NTP.getTime();
@@ -527,19 +512,10 @@ public class RNS {
                                         // a LINKREQUEST via outbound(Packet)) and starves announce/reconnect tasks.
                                         // The PENDING-failure backoff naturally rotates through peers across cycles.
                                         int outgoingLinksCreated = 0;
-                                        // Precompute the identity hashes of ACTIVE incoming BASE peers ONCE per cycle.
-                                        // Previously this was recomputed per target via a stream + hashFromNameAndIdentity
-                                        // (a SHA-256) over every incoming peer — O(targets × incoming) crypto hashing each
-                                        // cycle. A set lookup makes the per-target check O(1).
-                                        final Set<String> activeIncomingBaseHashes = new HashSet<>();
-                                        for (ReticulumPeer ip : getImmutableIncomingPeers()) {
-                                            Link ipl = ip.getPeerLink();
-                                            Identity rid = ip.getServerIdentity();
-                                            if (nonNull(ipl) && ipl.getStatus() == ACTIVE && rid != null) {
-                                                activeIncomingBaseHashes.add(
-                                                        encodeHexString(hashFromNameAndIdentity(CORE_ASPECT, rid)));
-                                            }
-                                        }
+                                        // Identity hashes of ACTIVE incoming BASE peers, computed ONCE per cycle
+                                        // (see RNSPeerRegistry.activeIncomingHashes for why per-target is costly).
+                                        final Set<String> activeIncomingBaseHashes =
+                                                registry.activeIncomingHashes(RNSCommon.PeerAspect.BASE);
                                         for (String hashHex : reconnectTargets) {
                                             try {
                                                 byte[] dhash = decodeHex(hashHex);
@@ -642,14 +618,8 @@ public class RNS {
         while (!isShuttingDown && !Thread.currentThread().isInterrupted()) {
             try {
                 final List<ReticulumPeer> peersThisRound = Stream.concat(
-                        this.getActiveImmutableLinkedPeers().stream()
-                                .filter(p -> p.getPeerAspect() == RNSCommon.PeerAspect.DATA),
-                        this.getImmutableIncomingPeers().stream()
-                                .filter(p -> p.getPeerAspect() == RNSCommon.PeerAspect.DATA)
-                                .filter(p -> {
-                                    var pl = p.getPeerLink();
-                                    return nonNull(pl) && pl.getStatus() == ACTIVE;
-                                })
+                        registry.activeLinked(RNSCommon.PeerAspect.DATA).stream(),
+                        registry.activeIncoming(RNSCommon.PeerAspect.DATA).stream()
                 ).collect(Collectors.toList());
 
                 final Long now = NTP.getTime();
@@ -724,8 +694,7 @@ public class RNS {
                     lastDataLoopReconnectMs = nowMs;
                     if (dataReconnectTaskStartedMs == 0L) {
                         dataReconnectTaskStartedMs = nowMs;
-                        final int activeData = (int) getActiveImmutableLinkedPeers().stream()
-                                .filter(p -> p.getPeerAspect() == RNSCommon.PeerAspect.DATA).count();
+                        final int activeData = registry.activeLinked(RNSCommon.PeerAspect.DATA).size();
                         final List<ReticulumPeer> currentDataLinked = getImmutableLinkedPeers().stream()
                                 .filter(p -> p.getPeerAspect() == RNSCommon.PeerAspect.DATA)
                                 .collect(Collectors.toList());
@@ -794,9 +763,8 @@ public class RNS {
 
     public void broadcast(Function<ReticulumPeer, Message> peerMessageBuilder) {
         List<ReticulumPeer> allPeers = Stream.concat(
-                getActiveImmutableLinkedPeers().stream(),
-                getImmutableIncomingPeers().stream()
-                        .filter(p -> nonNull(p.getPeerLink()) && p.getPeerLink().getStatus() == ACTIVE)
+                registry.activeLinked().stream(),
+                registry.activeIncoming().stream()
         ).collect(Collectors.toList());
 
         for (ReticulumPeer peer : allPeers) {
@@ -944,7 +912,7 @@ public class RNS {
         link.setRemoteIdentifiedCallback((l, id) -> onIncomingPeerIdentified(newPeer, id));
         newPeer.createPeerBuffer();
         addIncomingPeer(newPeer);
-        log.info("***> Data Client connected, data link: {}", encodeHexString(link.getLinkId()));
+        log.info("Data Client connected, data link: {}", encodeHexString(link.getLinkId()));
     }
 
     // ── reticulumAnnounceGateway: send / receive / dispatch ──────────────────
@@ -1185,20 +1153,16 @@ public class RNS {
         return SingletonContainer.INSTANCE;
     }
 
+    public List<ReticulumPeer> getImmutableLinkedPeers() {
+        return registry.linked();
+    }
+
+    public List<ReticulumPeer> getImmutableIncomingPeers() {
+        return registry.incoming();
+    }
+
     public List<ReticulumPeer> getActiveImmutableLinkedPeers() {
-        // Plain ArrayList: this is a private snapshot returned to a single caller, never shared.
-        // The old Collections.synchronizedList wrapper implied a thread-safety contract that the
-        // snapshot does not need, on a value allocated ~200 times/second by the two loops.
-        List<ReticulumPeer> activePeers = new ArrayList<>();
-        for (ReticulumPeer p: this.immutableLinkedPeers) {
-            // Exclude peers marked for removal (deleteMe=true): their buffer is dead even if
-            // the library-level link is still ACTIVE. Excluding them lets runBaseLoop() see
-            // the real active count and trigger reconnect without waiting for prunePeers().
-            if (nonNull(p.getPeerLink()) && (p.getPeerLink().getStatus() == ACTIVE) && !p.getDeleteMe()) {
-                activePeers.add(p);
-            }
-        }
-        return activePeers;
+        return registry.activeLinked();
     }
 
     /**
@@ -1224,29 +1188,23 @@ public class RNS {
     }
 
     public void addLinkedPeer(ReticulumPeer peer) {
-        // Atomic dedup: receivedAnnounce() and runBaseLoop() can both call this concurrently
-        // when a peer drops and reconnects — both see an empty slot and race to fill it.
-        synchronized (this.linkedPeers) {
-            boolean duplicate = this.linkedPeers.stream()
-                    .anyMatch(p -> Arrays.equals(p.getDestinationHash(), peer.getDestinationHash()));
-            if (duplicate) {
-                log.debug("addLinkedPeer: skipping duplicate for {}", encodeHexString(peer.getDestinationHash()));
-                // The loser was built via new ReticulumPeer(dhash), whose constructor already called
-                // initPeerLink() and sent the LINKREQUEST — so its Link is live (PENDING/establishing)
-                // even though we're discarding the peer. Closing it here prevents a leaked local
-                // watchdog thread AND stops the half-formed link from establishing on the remote as a
-                // spurious incoming peer (which would itself become a duplicate the remote must prune).
-                // The loser always holds its own fresh Link (distinct from the retained peer's), so
-                // closing it cannot disturb the live connection. Non-blocking volatile write only.
-                peer.closePeerLinkNonBlocking();
-                return;
-            }
-            this.linkedPeers.add(peer);
-            this.immutableLinkedPeers = List.copyOf(this.linkedPeers);
+        // The registry dedups atomically with the add: receivedAnnounce() and the reconnect task
+        // can both call this concurrently when a peer drops and reconnects.
+        if (!registry.addLinked(peer)) {
+            log.debug("addLinkedPeer: skipping duplicate for {}", encodeHexString(peer.getDestinationHash()));
+            // The loser was built via new ReticulumPeer(dhash), whose constructor already called
+            // initPeerLink() and sent the LINKREQUEST — so its Link is live (PENDING/establishing)
+            // even though we're discarding the peer. Closing it here prevents a leaked local
+            // watchdog thread AND stops the half-formed link from establishing on the remote as a
+            // spurious incoming peer (which would itself become a duplicate the remote must prune).
+            // The loser always holds its own fresh Link (distinct from the retained peer's), so
+            // closing it cannot disturb the live connection. Non-blocking volatile write only.
+            peer.closePeerLinkNonBlocking();
+            return;
         }
-        // Hash is added to knownPeerHashes only once the peer's buffer is confirmed ACTIVE
-        // (see confirmPeerHash(), called from ReticulumPeer.createPeerBuffer()). This prevents
-        // transient/failed connections from accumulating in the persisted peer list.
+        // Hash is persisted only once the peer's buffer is confirmed ACTIVE (see confirmPeerHash(),
+        // called from ReticulumPeer.createPeerBuffer()). This prevents transient/failed connections
+        // from accumulating in the persisted peer list.
     }
 
     public void removePeer(ReticulumPeer peer) {
@@ -1263,16 +1221,7 @@ public class RNS {
         // it themselves, passing the exact Link they decided on (see prunePeers) — closing here
         // would both re-read a peerLink that initPeerLink() may have re-pointed at a fresh Link,
         // and close PENDING links, which triggers the expirePath() cull cascade documented below.
-        //
-        // Mutation and snapshot rebuild must happen under the same lock addLinkedPeer() holds.
-        // Otherwise: this thread reads the backing list, an adder (holding the lock) adds a peer
-        // and publishes snapshot {P2}, then this thread publishes its stale snapshot {} — the new
-        // peer is in linkedPeers but invisible in immutableLinkedPeers until the next mutation,
-        // and every consumer (broadcast, runBaseLoop, prunePeers, findPeerBy*) reads the snapshot.
-        synchronized (this.linkedPeers) {
-            this.linkedPeers.remove(peer);
-            this.immutableLinkedPeers = List.copyOf(this.linkedPeers);
-        }
+        registry.removeLinked(peer);
         // Remove from Network's connected/handshaked lists on EVERY removal path. This was
         // previously commented out (and only some callers, e.g. prunePeers, called
         // makePeerUnavailable() explicitly first) — so removal paths that didn't, like
@@ -1285,36 +1234,16 @@ public class RNS {
     }
 
     public void addIncomingPeer(ReticulumPeer peer) {
-        // Dedup by remote identity + aspect: evict any existing incoming peer from the same
-        // node with the same aspect. Called from linkEstablished() where identity is known.
-        // Using CORE_ASPECT for both aspects would incorrectly match CORE/DATA peer pairs
-        // from the same remote node and evict the wrong one.
-        Identity newId = peer.getServerIdentity();
-        String newAspect = (peer.getPeerAspect() == RNSCommon.PeerAspect.DATA) ? QDN_ASPECT : CORE_ASPECT;
-        synchronized (this.incomingPeers) {
-            if (newId != null) {
-                byte[] newHash = hashFromNameAndIdentity(newAspect, newId);
-                Iterator<ReticulumPeer> it = this.incomingPeers.iterator();
-                while (it.hasNext()) {
-                    ReticulumPeer existing = it.next();
-                    Identity existingId = existing.getServerIdentity();
-                    String existingAspect = (existing.getPeerAspect() == RNSCommon.PeerAspect.DATA) ? QDN_ASPECT : CORE_ASPECT;
-                    if (existingId != null && existingAspect.equals(newAspect)
-                            && Arrays.equals(hashFromNameAndIdentity(existingAspect, existingId), newHash)) {
-                        log.info("addIncomingPeer: replacing stale {} incoming peer from {}",
-                                newAspect, encodeHexString(newHash));
-                        it.remove();
-                        existing.shutdownChannel();
-                        // The superseded peer always holds a different Link object than the
-                        // replacement (both baseClientConnected and dataClientConnected build a
-                        // fresh ReticulumPeer per incoming Link), so closing it cannot disturb the
-                        // new peer. Without this its watchdog thread leaks (see removeLinkedPeer).
-                        closeIfActive(existing);
-                    }
-                }
-            }
-            this.incomingPeers.add(peer);
-            this.immutableIncomingPeers = List.copyOf(this.incomingPeers);
+        // The registry evicts any existing incoming peer from the same node with the same aspect
+        // (identity + aspect, so a remote's CORE and DATA peers don't evict each other) and hands
+        // the superseded ones back for teardown out here, with no registry lock held.
+        for (ReticulumPeer superseded : registry.addIncoming(peer)) {
+            superseded.shutdownChannel();
+            // The superseded peer always holds a different Link object than the replacement (both
+            // baseClientConnected and dataClientConnected build a fresh ReticulumPeer per incoming
+            // Link), so closing it cannot disturb the new peer. Without this its watchdog thread
+            // leaks (see removeLinkedPeer).
+            closeIfActive(superseded);
         }
     }
 
@@ -1358,29 +1287,12 @@ public class RNS {
      */
     public void dedupIncomingPeerByIdentity(ReticulumPeer keep) {
         if (this.isShuttingDown) return;
-        Identity keepId = keep.getServerIdentity();
-        if (keepId == null) return;
-        String keepAspect = (keep.getPeerAspect() == RNSCommon.PeerAspect.DATA) ? QDN_ASPECT : CORE_ASPECT;
-        byte[] keepHash = hashFromNameAndIdentity(keepAspect, keepId);
+        if (keep.getServerIdentity() == null) return;
         try {
             rnsWorkerPool.submit(() -> {
-                List<ReticulumPeer> toRemove = new ArrayList<>();
-                synchronized (this.incomingPeers) {
-                    for (ReticulumPeer p : this.incomingPeers) {
-                        if (p == keep) continue;
-                        Identity pid = p.getServerIdentity();
-                        if (pid == null) continue;
-                        String pAspect = (p.getPeerAspect() == RNSCommon.PeerAspect.DATA) ? QDN_ASPECT : CORE_ASPECT;
-                        if (pAspect.equals(keepAspect)
-                                && Arrays.equals(hashFromNameAndIdentity(pAspect, pid), keepHash)) {
-                            toRemove.add(p);
-                        }
-                    }
-                }
-                // removeIncomingPeer() mutates the list itself, so evict outside the loop/lock above.
-                for (ReticulumPeer p : toRemove) {
+                for (ReticulumPeer p : registry.duplicateIncomingByIdentity(keep)) {
                     log.info("dedupIncomingPeerByIdentity: removing duplicate {} incoming peer from {}",
-                            keepAspect, encodeHexString(keepHash));
+                            p.getPeerAspect(), RNSPeerRegistry.incomingIdentityKey(p));
                     removeIncomingPeer(p);
                 }
             });
@@ -1414,11 +1326,7 @@ public class RNS {
         // built fresh per Link (baseClientConnected/dataClientConnected) and never re-initiated, so
         // reading peerLink here cannot pick up a replacement. Only ACTIVE: see removeLinkedPeer.
         closeIfActive(peer);
-        // Same lock as addIncomingPeer() — see removeLinkedPeer() for the stale-snapshot race.
-        synchronized (this.incomingPeers) {
-            this.incomingPeers.remove(peer);
-            this.immutableIncomingPeers = List.copyOf(this.incomingPeers);
-        }
+        registry.removeIncoming(peer);
         // Incoming BASE peers are also registered in Network's connected/handshaked lists via
         // makePeerAvailable(); remove them here so they don't leak (see removeLinkedPeer).
         peer.makePeerUnavailable();
@@ -1445,27 +1353,9 @@ public class RNS {
         return false;
     }
 
-    /**
-     * Incoming peers whose link is missing or not ACTIVE.
-     * <p>
-     * Iterates the immutable snapshot: for-each over the live {@code Collections.synchronizedList}
-     * without holding its monitor throws ConcurrentModificationException as soon as
-     * addIncomingPeer()/removeIncomingPeer() runs concurrently, and prunePeers() calls this three
-     * times per cycle. The returned list is a private snapshot, so it needs no synchronized wrapper.
-     */
+    /** Incoming peers whose link is missing or not ACTIVE. */
     public List<ReticulumPeer> getNonActiveIncomingPeers() {
-        List<ReticulumPeer> result = new ArrayList<>();
-        for (ReticulumPeer p: getImmutableIncomingPeers()) {
-            Link pl = p.getPeerLink();
-            if (nonNull(pl)) {
-                if (pl.getStatus() != ACTIVE) {
-                    result.add(p);
-                }
-            } else {
-                result.add(p);
-            }
-        }
-        return result;
+        return registry.nonActiveIncoming();
     }
 
     public void prunePeers() throws DataException {
@@ -1559,29 +1449,13 @@ public class RNS {
         // Dedup ACTIVE incoming peers by remote identity. linkEstablished() resolves the identity
         // (null at construction time because the handshake wasn't complete yet), so by prune time
         // (~60s later) it is available. Keep the newest peer per identity; remove the rest.
-        {
-            Map<String, List<ReticulumPeer>> byIdentity = new HashMap<>();
-            for (ReticulumPeer p : getImmutableIncomingPeers()) {
-                Link pl = p.getPeerLink();
-                if (nonNull(pl) && pl.getStatus() == ACTIVE) {
-                    Identity remoteId = p.getServerIdentity();
-                    if (remoteId != null) {
-                        String aspect = (p.getPeerAspect() == RNSCommon.PeerAspect.DATA) ? QDN_ASPECT : CORE_ASPECT;
-                        String key = encodeHexString(hashFromNameAndIdentity(aspect, remoteId));
-                        byIdentity.computeIfAbsent(key, k -> new ArrayList<>()).add(p);
-                    }
-                }
-            }
-            for (Map.Entry<String, List<ReticulumPeer>> entry : byIdentity.entrySet()) {
-                List<ReticulumPeer> dupes = entry.getValue();
-                if (dupes.size() > 1) {
-                    // Keep the one with the most recent data; remove the rest
-                    dupes.sort((a, b) -> b.getLastAccessTimestamp().compareTo(a.getLastAccessTimestamp()));
-                    for (int i = 1; i < dupes.size(); i++) {
-                        log.info("prunePeers: removing duplicate ACTIVE incoming peer from {}", entry.getKey());
-                        removeIncomingPeer(dupes.get(i));
-                    }
-                }
+        for (Map.Entry<String, List<ReticulumPeer>> entry : registry.activeIncomingDuplicateGroups().entrySet()) {
+            List<ReticulumPeer> dupes = entry.getValue();
+            // Keep the one with the most recent data; remove the rest
+            dupes.sort((a, b) -> b.getLastAccessTimestamp().compareTo(a.getLastAccessTimestamp()));
+            for (int i = 1; i < dupes.size(); i++) {
+                log.info("prunePeers: removing duplicate ACTIVE incoming peer from {}", entry.getKey());
+                removeIncomingPeer(dupes.get(i));
             }
         }
         // Prune ACTIVE incoming peers that have gone silent: the initiator moved to a new
@@ -1682,14 +1556,8 @@ public class RNS {
     // Used by NetworkData for outbound QDN dispatch over Reticulum.
     public List<ReticulumPeer> getActiveDataPeers() {
         return Stream.concat(
-                getActiveImmutableLinkedPeers().stream()
-                        .filter(p -> p.getPeerAspect() == RNSCommon.PeerAspect.DATA),
-                getImmutableIncomingPeers().stream()
-                        .filter(p -> p.getPeerAspect() == RNSCommon.PeerAspect.DATA)
-                        .filter(p -> {
-                            var pl = p.getPeerLink();
-                            return nonNull(pl) && pl.getStatus() == ACTIVE;
-                        })
+                registry.activeLinked(RNSCommon.PeerAspect.DATA).stream(),
+                registry.activeIncoming(RNSCommon.PeerAspect.DATA).stream()
         ).collect(Collectors.toList());
     }
 

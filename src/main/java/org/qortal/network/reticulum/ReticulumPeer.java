@@ -91,7 +91,16 @@ import java.lang.IllegalStateException;
 @Slf4j
 public class ReticulumPeer implements Peer {
 
-    static final String APP_NAME = Settings.getInstance().isTestNet() ? RNSCommon.TESTNET_APP_NAME: RNSCommon.MAINNET_APP_NAME;
+    /**
+     * Resolved on use, not in a static initialiser: reading Settings during class initialisation
+     * loads the settings file, which in turn initialises BlockChain and the crypto stack. That
+     * makes the class impossible to touch (even to mock) without booting most of the node, and
+     * turns any settings problem into a NoClassDefFoundError far from its cause. Settings is a
+     * cached singleton, so resolving per call costs nothing.
+     */
+    private static String appName() {
+        return Settings.getInstance().isTestNet() ? RNSCommon.TESTNET_APP_NAME : RNSCommon.MAINNET_APP_NAME;
+    }
     //static final String defaultConfigPath = new String(".reticulum");
     //static final String defaultConfigPath = RNSCommon.defaultRNSConfigPath;
 
@@ -333,7 +342,7 @@ public class ReticulumPeer implements Peer {
             this.serverIdentity,
             Direction.OUT,
             DestinationType.SINGLE,
-            APP_NAME,
+            appName(),
             peerAspect == RNSCommon.PeerAspect.DATA ? "qdn" : "core"
         );
         peerDestination.setProofStrategy(ProofStrategy.PROVE_ALL);
