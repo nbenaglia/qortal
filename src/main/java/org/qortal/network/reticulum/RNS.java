@@ -3,8 +3,6 @@ package org.qortal.network.reticulum;
 import io.reticulum.Reticulum;
 import io.reticulum.Transport;
 import io.reticulum.interfaces.ConnectionInterface;
-import io.reticulum.interfaces.backbone.BackboneClientInterface;
-import io.reticulum.utils.InterfaceUtils;
 import io.reticulum.destination.Destination;
 import io.reticulum.destination.DestinationType;
 import io.reticulum.destination.Direction;
@@ -26,7 +24,6 @@ import org.qortal.repository.DataException;
 import org.qortal.settings.Settings;
 
 import java.io.IOException;
-import java.net.InetAddress;
 import java.nio.charset.StandardCharsets;
 import static java.nio.file.StandardOpenOption.CREATE;
 import static java.nio.file.StandardOpenOption.WRITE;
@@ -44,6 +41,7 @@ import java.time.Instant;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
+import static org.apache.commons.codec.binary.Hex.decodeHex;
 import static org.apache.commons.codec.binary.Hex.encodeHexString;
 import org.qortal.utils.ExecuteProduceConsume;
 import org.qortal.utils.NTP;
@@ -89,8 +87,8 @@ public class RNS {
     // Reticulum library times out at ~75 s → expirePath() → 60-120 s cull → cascade.
     // After a stuck-PENDING failure or immediate send failure, we back off to requestPath() for
     // PENDING_FAILURE_BACKOFF_MS so the backbone can provide a fresh announce path.
-    private final java.util.concurrent.ConcurrentHashMap<String, Long> pendingLinkFailureMs =
-            new java.util.concurrent.ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Long> pendingLinkFailureMs =
+            new ConcurrentHashMap<>();
     private static final long PENDING_FAILURE_BACKOFF_MS = 60_000L; // base backoff (first failure); 60s
     // Consecutive PENDING/link failures per peer hash (BASE and DATA hashes are distinct, so one map
     // serves both). Drives CAPPED EXPONENTIAL backoff: a permanently-unreachable peer (e.g. a mis-
@@ -98,8 +96,8 @@ public class RNS {
     // a PENDING link → expirePath() cull cascade → sustained reconnect-thread CPU. Backoff doubles per
     // failure up to MAX_PENDING_FAILURE_BACKOFF_MS, so stale peers become effectively dormant. Reset on
     // a successful ACTIVE connection (confirmPeerHash) so transient outages aren't penalised long-term.
-    private final java.util.concurrent.ConcurrentHashMap<String, Integer> pendingFailureCount =
-            new java.util.concurrent.ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Integer> pendingFailureCount =
+            new ConcurrentHashMap<>();
     private static final long MAX_PENDING_FAILURE_BACKOFF_MS = 30 * 60_000L; // 30 min cap
 
     /**
@@ -114,15 +112,10 @@ public class RNS {
     private final List<ReticulumPeer> incomingPeers = Collections.synchronizedList(new ArrayList<>());
     @Getter private volatile List<ReticulumPeer> immutableIncomingPeers = Collections.emptyList();
 
-    // ── Gateway announce (reticulumAnnounceGateway) ──────────────────────────
-    // When enabled, the node embeds its own backbone server endpoint as an
-    // appData payload on each announce; peers receiving the announce can then
-    // dynamically add a BackboneClientInterface to discover gateways without
-    // every node needing them hardcoded in settings.
-    // The payload itself (QAN1 container, legacy QGW1 fallback) lives in RNSAnnounceCodec.
-    private static final Duration GATEWAY_COOLDOWN = Duration.ofMinutes(10);
-    /** host:port → last time we considered adding (success or skip), to throttle churn. */
-    private final Map<String, Instant> recentGatewayAttempts = new ConcurrentHashMap<>();
+    // Gateway announce (reticulumAnnounceGateway): advertise-host resolution and dialling of
+    // peer-announced gateways live in RNSGatewayManager; the announce payload that carries them
+    // (QAN1 container, legacy QGW1 fallback) lives in RNSAnnounceCodec.
+    private final RNSGatewayManager gatewayManager;
 
     /** Announced version keyed by identity hash (hex). Lets incoming peers (which have no announce
      *  at construction) resolve their version once they identify. Bounded LRU to avoid unbounded
@@ -131,12 +124,6 @@ public class RNS {
             new LinkedHashMap<String, String>(64, 0.75f, true) {
                 @Override protected boolean removeEldestEntry(Map.Entry<String, String> e) { return size() > 512; }
             });
-    /** Local FQDN cached at first use (whatever JDK returns — used only for self-skip). */
-    private volatile String localFqdn;
-    /** Host this node will advertise (either explicit setting or validated auto-detect). null = don't advertise. */
-    private volatile String advertiseHost;
-    /** Guards one-time logging of the chosen advertise host. */
-    private volatile boolean advertiseHostResolved = false;
 
     /** Produces Connect tasks for the baseDestination and submits to worker pool. */
     private Thread rnsBaseThread;
@@ -185,8 +172,8 @@ public class RNS {
     // never inline on the runBaseLoop thread.
     private volatile long announceTaskStartedMs = 0L;
     private volatile long reconnectTaskStartedMs = 0L;
-    private volatile java.util.concurrent.Future<?> announceTaskFuture = null;
-    private volatile java.util.concurrent.Future<?> reconnectTaskFuture = null;
+    private volatile Future<?> announceTaskFuture = null;
+    private volatile Future<?> reconnectTaskFuture = null;
     // Circuit breaker: when both announce and reconnect tasks keep timing out consecutively,
     // the backbone TCP connection is likely in a bad state. Force-close it to trigger the
     // library's built-in auto-reconnect rather than spinning on a stuck jobsLock forever.
@@ -200,18 +187,18 @@ public class RNS {
     private volatile long lastDataLoopReconnectMs = 0;
     private volatile long dataAnnounceTaskStartedMs  = 0L;
     private volatile long dataReconnectTaskStartedMs = 0L;
-    private volatile java.util.concurrent.Future<?> dataAnnounceTaskFuture  = null;
-    private volatile java.util.concurrent.Future<?> dataReconnectTaskFuture = null;
+    private volatile Future<?> dataAnnounceTaskFuture  = null;
+    private volatile Future<?> dataReconnectTaskFuture = null;
 
-    private final java.util.concurrent.ConcurrentHashMap<String, Long> pendingDataLinkFailureMs =
-            new java.util.concurrent.ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Long> pendingDataLinkFailureMs =
+            new ConcurrentHashMap<>();
 
     /**
      * Record a PENDING/link-establishment failure for a peer: stamp the failure time in the
      * aspect-specific time map and increment the shared failure counter (for exponential backoff).
      */
     private void recordPendingFailure(String hashHex,
-            java.util.concurrent.ConcurrentHashMap<String, Long> timeMap) {
+            ConcurrentHashMap<String, Long> timeMap) {
         timeMap.put(hashHex, System.currentTimeMillis());
         pendingFailureCount.merge(hashHex, 1, Integer::sum);
     }
@@ -255,11 +242,7 @@ public class RNS {
         consecutiveStuckTasks = 0; // reset so we don't spam per-interval
         log.warn("runBaseLoop: {} consecutive stuck tasks — forcing backbone TCP reconnect to clear deadlock",
                 BACKBONE_FORCE_RECONNECT_THRESHOLD);
-        for (io.reticulum.interfaces.ConnectionInterface iface : Transport.getInstance().getInterfaces()) {
-            if (iface instanceof io.reticulum.interfaces.backbone.BackboneClientInterface) {
-                ((io.reticulum.interfaces.backbone.BackboneClientInterface) iface).forceReconnect();
-            }
-        }
+        gatewayManager.forceBackboneReconnect();
     }
 
     // Constructor
@@ -279,6 +262,7 @@ public class RNS {
         log.info("reticulum instance created");
         log.debug("reticulum instance created: {}", reticulum);
         var rnsThreadPriority = Settings.getInstance().getNetworkThreadPriority(); // default: 7
+        this.gatewayManager = new RNSGatewayManager(APP_NAME, TARGET_PORT, rnsThreadPriority);
         this.rnsWorkerPool = new ThreadPoolExecutor(
                 3, Settings.getInstance().getReticulumMaxNetworkThreadPoolSize(),
                 NETWORK_EPC_KEEPALIVE, TimeUnit.SECONDS,
@@ -435,7 +419,7 @@ public class RNS {
                                     log.warn("Reticulum worker task threw: {}", e.getMessage(), e);
                                 }
                             });
-                        } catch (java.util.concurrent.RejectedExecutionException e) {
+                        } catch (RejectedExecutionException e) {
                             log.warn("[{}] Reticulum worker pool rejected message task (pool full or shutting down)",
                                     peer.getPeerConnectionId());
                             break;
@@ -456,7 +440,7 @@ public class RNS {
                                     log.warn("Reticulum ping task threw: {}", e.getMessage(), e);
                                 }
                             });
-                        } catch (java.util.concurrent.RejectedExecutionException e) {
+                        } catch (RejectedExecutionException e) {
                             log.warn("[{}] Reticulum worker pool rejected ping task", peer.getPeerConnectionId());
                         }
                     }
@@ -474,7 +458,7 @@ public class RNS {
                     if (taskStart != 0 && (nowMs - taskStart > ANNOUNCE_TASK_TIMEOUT_MS)) {
                         log.warn("runBaseLoop: announce task running for {}s — interrupting stuck task",
                                 (nowMs - taskStart) / 1000);
-                        java.util.concurrent.Future<?> f = announceTaskFuture;
+                        Future<?> f = announceTaskFuture;
                         if (f != null && !f.isDone()) f.cancel(true);
                         ((ThreadPoolExecutor) announceExecutor).purge();
                         announceTaskStartedMs = 0L;
@@ -500,7 +484,7 @@ public class RNS {
                                     announceTaskStartedMs = 0L;
                                 }
                             });
-                        } catch (java.util.concurrent.RejectedExecutionException e) {
+                        } catch (RejectedExecutionException e) {
                             announceTaskStartedMs = 0L;
                         }
                     }
@@ -515,7 +499,7 @@ public class RNS {
                     if (rTaskStart != 0 && (nowMs - rTaskStart > RECONNECT_TASK_TIMEOUT_MS)) {
                         log.warn("runBaseLoop: reconnect task running for {}s — interrupting stuck task",
                                 (nowMs - rTaskStart) / 1000);
-                        java.util.concurrent.Future<?> rf = reconnectTaskFuture;
+                        Future<?> rf = reconnectTaskFuture;
                         if (rf != null && !rf.isDone()) rf.cancel(true);
                         ((ThreadPoolExecutor) reconnectExecutor).purge();
                         reconnectTaskStartedMs = 0L;
@@ -532,7 +516,7 @@ public class RNS {
                                 Thread.interrupted(); // clear any stale interrupt flag from prior cancel
                                 try {
                                     // Log interface online status for diagnostics
-                                    for (io.reticulum.interfaces.ConnectionInterface iface : Transport.getInstance().getInterfaces()) {
+                                    for (ConnectionInterface iface : Transport.getInstance().getInterfaces()) {
                                         log.info("Interface '{}' online={}", iface.getInterfaceName(), iface.isOnline());
                                     }
                                     if (activeLinked < MIN_DESIRED_CORE_PEERS && !reconnectTargets.isEmpty()) {
@@ -558,7 +542,7 @@ public class RNS {
                                         }
                                         for (String hashHex : reconnectTargets) {
                                             try {
-                                                byte[] dhash = org.apache.commons.codec.binary.Hex.decodeHex(hashHex);
+                                                byte[] dhash = decodeHex(hashHex);
                                                 // Skip peers already tracked (PENDING or ACTIVE) as initiator links
                                                 boolean tracked = currentLinked.stream()
                                                         .anyMatch(p -> Arrays.equals(p.getDestinationHash(), dhash));
@@ -626,7 +610,7 @@ public class RNS {
                                     reconnectTaskStartedMs = 0L;
                                 }
                             });
-                        } catch (java.util.concurrent.RejectedExecutionException e) {
+                        } catch (RejectedExecutionException e) {
                             reconnectTaskStartedMs = 0L;
                         }
                     }
@@ -684,7 +668,7 @@ public class RNS {
                                     log.warn("Reticulum DATA worker task threw: {}", e.getMessage(), e);
                                 }
                             });
-                        } catch (java.util.concurrent.RejectedExecutionException e) {
+                        } catch (RejectedExecutionException e) {
                             log.warn("[{}] Reticulum DATA worker pool rejected message task", peer.getPeerConnectionId());
                             break;
                         }
@@ -703,7 +687,7 @@ public class RNS {
                                     log.warn("Reticulum DATA ping task threw: {}", e.getMessage(), e);
                                 }
                             });
-                        } catch (java.util.concurrent.RejectedExecutionException e) {
+                        } catch (RejectedExecutionException e) {
                             log.warn("[{}] Reticulum DATA worker pool rejected ping task", peer.getPeerConnectionId());
                         }
                     }
@@ -729,7 +713,7 @@ public class RNS {
                                     }
                                 }
                             });
-                        } catch (java.util.concurrent.RejectedExecutionException e) {
+                        } catch (RejectedExecutionException e) {
                             dataAnnounceTaskStartedMs = 0L;
                         }
                     }
@@ -755,7 +739,7 @@ public class RNS {
                                                 activeData, MIN_DESIRED_DATA_PEERS, dataTargets.size());
                                         for (String hashHex : dataTargets) {
                                             try {
-                                                byte[] dhash = org.apache.commons.codec.binary.Hex.decodeHex(hashHex);
+                                                byte[] dhash = decodeHex(hashHex);
                                                 boolean tracked = currentDataLinked.stream()
                                                         .anyMatch(p -> Arrays.equals(p.getDestinationHash(), dhash));
                                                 if (tracked) continue;
@@ -786,7 +770,7 @@ public class RNS {
                                     }
                                 }
                             });
-                        } catch (java.util.concurrent.RejectedExecutionException e) {
+                        } catch (RejectedExecutionException e) {
                             dataReconnectTaskStartedMs = 0L;
                         }
                     }
@@ -892,16 +876,17 @@ public class RNS {
         this.reconnectExecutor.shutdown();
         this.dataAnnounceExecutor.shutdown();
         this.dataReconnectExecutor.shutdown();
+        this.gatewayManager.shutdown();
         try {
-            if (!this.rnsWorkerPool.awaitTermination(2, java.util.concurrent.TimeUnit.SECONDS))
+            if (!this.rnsWorkerPool.awaitTermination(2, TimeUnit.SECONDS))
                 this.rnsWorkerPool.shutdownNow();
-            if (!this.announceExecutor.awaitTermination(2, java.util.concurrent.TimeUnit.SECONDS))
+            if (!this.announceExecutor.awaitTermination(2, TimeUnit.SECONDS))
                 this.announceExecutor.shutdownNow();
-            if (!this.reconnectExecutor.awaitTermination(2, java.util.concurrent.TimeUnit.SECONDS))
+            if (!this.reconnectExecutor.awaitTermination(2, TimeUnit.SECONDS))
                 this.reconnectExecutor.shutdownNow();
-            if (!this.dataAnnounceExecutor.awaitTermination(2, java.util.concurrent.TimeUnit.SECONDS))
+            if (!this.dataAnnounceExecutor.awaitTermination(2, TimeUnit.SECONDS))
                 this.dataAnnounceExecutor.shutdownNow();
-            if (!this.dataReconnectExecutor.awaitTermination(2, java.util.concurrent.TimeUnit.SECONDS))
+            if (!this.dataReconnectExecutor.awaitTermination(2, TimeUnit.SECONDS))
                 this.dataReconnectExecutor.shutdownNow();
         } catch (InterruptedException e) {
             this.rnsWorkerPool.shutdownNow();
@@ -981,7 +966,7 @@ public class RNS {
         if (!Settings.getInstance().getReticulumAnnounceGateway()) return null;
         if (!Settings.getInstance().getReticulumIsGateway())       return null;
 
-        String host = getAdvertiseHost();
+        String host = gatewayManager.getAdvertiseHost();
         // The codec drops a host it cannot encode; say so, or the gateway would silently never be
         // advertised. +1 (hostLen) +2 (port) must fit a single-byte TLV length.
         if (host != null && host.getBytes(StandardCharsets.UTF_8).length > 252) {
@@ -989,48 +974,6 @@ public class RNS {
             return null;
         }
         return host;
-    }
-
-    /**
-     * Returns the host string this node will advertise (explicit setting, or
-     * validated auto-detect), or null if no usable host could be determined.
-     * Logs the decision once at first call. Cached for subsequent calls.
-     */
-    private String getAdvertiseHost() {
-        if (advertiseHostResolved) return advertiseHost;
-
-        synchronized (this) {
-            if (advertiseHostResolved) return advertiseHost;
-
-            String explicit = Settings.getInstance().getReticulumAnnouncedHost();
-            String chosen;
-            String source;
-            if (explicit != null && !explicit.trim().isEmpty()) {
-                chosen = explicit.trim();
-                source = "reticulumAnnouncedHost setting";
-            } else {
-                String detected = getLocalFqdn();
-                if (RNSAnnounceCodec.isUsableAdvertiseHost(detected)) {
-                    chosen = detected;
-                    source = "auto-detected FQDN";
-                } else {
-                    chosen = null;
-                    source = "auto-detected FQDN '" + detected + "' is not usable";
-                }
-            }
-
-            if (chosen != null) {
-                log.info("Reticulum gateway announce: will advertise host '{}:{}' (source: {})",
-                        chosen, TARGET_PORT, source);
-            } else {
-                log.warn("Reticulum gateway announce: no usable host to advertise ({}); "
-                        + "set reticulumAnnouncedHost to your publicly-resolvable FQDN to enable",
-                        source);
-            }
-            advertiseHost = chosen;
-            advertiseHostResolved = true;
-            return chosen;
-        }
     }
 
     /** Record a peer's announced version, keyed by identity hash, for later lookup by incoming peers. */
@@ -1043,129 +986,6 @@ public class RNS {
     public String getAnnouncedVersion(Identity identity) {
         if (identity == null || identity.getHash() == null) return null;
         return announcedVersions.get(encodeHexString(identity.getHash()));
-    }
-
-    /**
-     * Cached on first use. Reads canonical hostname so a peer hearing our
-     * announce echo (looped back via a relay) doesn't trigger a self-connect.
-     */
-    private String getLocalFqdn() {
-        String fqdn = localFqdn;
-        if (fqdn == null) {
-            try {
-                fqdn = InetAddress.getLocalHost().getCanonicalHostName();
-            } catch (Exception e) {
-                log.warn("Cannot resolve local FQDN for gateway announce: {}", e.getMessage());
-                fqdn = "";
-            }
-            localFqdn = fqdn;
-        }
-        return fqdn;
-    }
-
-    /**
-     * Decide whether to dial a peer-advertised gateway and, if yes, dynamically
-     * register a {@link BackboneClientInterface}. Enforces:
-     *   - self-skip (advertised host == our FQDN)
-     *   - dedup against existing interfaces (same target host/port)
-     *   - per-endpoint cooldown to prevent churn from repeated announces
-     *   - total initiator backbone-client cap = reticulumDesiredClientInterfaces
-     *   - IFAC setup using the configured passphrase and network name
-     *
-     * All failure paths log at WARN/DEBUG and return — never throw to caller.
-     */
-    private void maybeAddDynamicGateway(String host, int port) {
-        if (host == null || host.isEmpty() || port < 1 || port > 0xFFFF) return;
-        String endpoint = host + ":" + port;
-
-        // Reject misconfigured peer announces (localhost, loopback, single-label
-        // names). Without this guard, a sender whose auto-detected FQDN was bad
-        // would have every receiver pointlessly try to dial 127.0.0.1, its own
-        // hostname, etc.
-        if (!RNSAnnounceCodec.isUsableAdvertiseHost(host)) {
-            log.debug("Gateway announce: dropping unusable host '{}' (likely misconfigured peer)", host);
-            return;
-        }
-
-        // Self-skip: compare against both our advertised name (if any) and our
-        // local FQDN (whatever JDK returned, even if not usable for advertising).
-        // Belt-and-suspenders so we don't dial ourselves via either route.
-        if (host.equalsIgnoreCase(getLocalFqdn())) {
-            log.debug("Gateway announce: ignoring self via local FQDN ({}:{})", host, port);
-            return;
-        }
-        String myAdvertise = getAdvertiseHost();
-        if (myAdvertise != null && host.equalsIgnoreCase(myAdvertise)) {
-            log.debug("Gateway announce: ignoring self via advertised host ({}:{})", host, port);
-            return;
-        }
-
-        // Cooldown: skip if we've considered this endpoint recently.
-        Instant now = Instant.now();
-        // Evict entries that are past the cooldown: without this the map keeps one entry per
-        // host:port ever announced, for the process lifetime, on a mesh-wide announce stream.
-        // Entries older than the cooldown can no longer suppress anything, so dropping them is
-        // behaviour-neutral.
-        recentGatewayAttempts.values().removeIf(
-                t -> Duration.between(t, now).compareTo(GATEWAY_COOLDOWN) >= 0);
-        Instant last = recentGatewayAttempts.get(endpoint);
-        if (last != null && Duration.between(last, now).compareTo(GATEWAY_COOLDOWN) < 0) {
-            return; // silently — this is the steady-state path on repeated announces
-        }
-        recentGatewayAttempts.put(endpoint, now);
-
-        // Already have an interface to this endpoint? (Static, prior-dynamic, or
-        // matching by autoconnect hash.)
-        for (ConnectionInterface iface : Transport.getInstance().getInterfaces()) {
-            if (host.equalsIgnoreCase(iface.getTargetHost()) && port == iface.getTargetPort()) {
-                log.debug("Gateway {} already has a configured interface; skipping", endpoint);
-                return;
-            }
-        }
-
-        // Cap: count initiator BackboneClientInterface instances (static + dynamic);
-        // the user-configured cap caps the total, not just the dynamic share.
-        int maxClients = Settings.getInstance().getReticulumDesiredClientInterfaces();
-        long currentInitiators = Transport.getInstance().getInterfaces().stream()
-                .filter(i -> i instanceof BackboneClientInterface
-                        && ((BackboneClientInterface) i).isInitiator())
-                .count();
-        if (currentInitiators >= maxClients) {
-            log.debug("Gateway {}: at client interface cap ({} >= {}); not adding",
-                    endpoint, currentInitiators, maxClients);
-            return;
-        }
-
-        log.info("Dynamically adding announced backbone gateway {} (initiators {}/{})",
-                endpoint, currentInitiators + 1, maxClients);
-
-        try {
-            BackboneClientInterface iface = new BackboneClientInterface();
-            iface.setInterfaceName("Backbone Client Interface qortal " + host + " (announced)");
-            iface.setTargetHost(host);
-            iface.setTargetPort(port);
-            iface.setEnabled(true);
-
-            // IFAC setup — same passphrase as the static interfaces, otherwise
-            // the handshake against an IFAC-protected backbone server will fail.
-            String networkName = Settings.getInstance().getReticulumNetworkName();
-            if (networkName == null || networkName.isEmpty()) networkName = APP_NAME;
-            iface.setIfacNetName(networkName);
-            String passphrase = Settings.getInstance().getReticulumPassphrase();
-            if (passphrase != null && !passphrase.isEmpty()) {
-                iface.setIfacNetKey(passphrase);
-            }
-            if (!InterfaceUtils.initIFac(iface)) {
-                log.warn("Gateway {}: IFAC init returned false; aborting dynamic add", endpoint);
-                return;
-            }
-
-            Transport.getInstance().getInterfaces().add(iface);
-            iface.launch();
-        } catch (Exception e) {
-            log.warn("Gateway {}: failed to register dynamic backbone client interface: {}",
-                    endpoint, e.getMessage());
-        }
     }
 
     private class QAnnounceHandler implements AnnounceHandler {
@@ -1186,6 +1006,11 @@ public class RNS {
         }
 
         @Override
+        // Serialises announce processing per handler instance. Note the two instances (BASE, DATA)
+        // hold separate Lombok $locks, so this does NOT serialise the aspects against each other —
+        // it only stops one aspect's announces from interleaving with themselves. Cheap now that
+        // the gateway dial (a TCP connect) runs on RNSGatewayManager's executor rather than here,
+        // on Reticulum's announce-delivery thread.
         @Synchronized
         public void receivedAnnounce(byte[] destinationHash,
                                      Identity announcedIdentity,
@@ -1216,7 +1041,7 @@ public class RNS {
                 // If the announce advertises a Qortal gateway, optionally dial it as a dynamic
                 // backbone client interface.
                 if (info.hasGateway()) {
-                    maybeAddDynamicGateway(info.getGatewayHost(), info.getGatewayPort());
+                    gatewayManager.maybeAddDynamicGateway(info.getGatewayHost(), info.getGatewayPort());
                 }
                 // Cache the announced version so incoming peers (no announce at construction) can
                 // resolve it once they identify.
@@ -1393,7 +1218,7 @@ public class RNS {
                 }
                 triggerImmediateAnnounce(); // kick runBaseLoop to reconnect within ~5s
             });
-        } catch (java.util.concurrent.RejectedExecutionException e) {
+        } catch (RejectedExecutionException e) {
             // Pool shut down — prunePeers() will clean up on next cycle
         }
     }
@@ -1559,7 +1384,7 @@ public class RNS {
                     removeIncomingPeer(p);
                 }
             });
-        } catch (java.util.concurrent.RejectedExecutionException e) {
+        } catch (RejectedExecutionException e) {
             // Pool shut down — prunePeers() will clean up on next cycle
         }
     }
@@ -1694,7 +1519,7 @@ public class RNS {
                     // new link and then finds peerTimedOut=true from the old teardown).
                     // Keeping them forever blocks QAnnounceHandler (peerExists=true,
                     // status != CLOSED, so the announce is silently ignored).
-                    long pendingSeconds = java.time.Duration.between(
+                    long pendingSeconds = Duration.between(
                             p.getCreationTimestamp(), Instant.now()).getSeconds();
                     if (pendingSeconds > 60) {
                         log.info("Removing PENDING link stuck for {}s: {}", pendingSeconds, p);
@@ -1735,7 +1560,7 @@ public class RNS {
         // (null at construction time because the handshake wasn't complete yet), so by prune time
         // (~60s later) it is available. Keep the newest peer per identity; remove the rest.
         {
-            Map<String, List<ReticulumPeer>> byIdentity = new java.util.HashMap<>();
+            Map<String, List<ReticulumPeer>> byIdentity = new HashMap<>();
             for (ReticulumPeer p : getImmutableIncomingPeers()) {
                 Link pl = p.getPeerLink();
                 if (nonNull(pl) && pl.getStatus() == ACTIVE) {
