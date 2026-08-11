@@ -1,4 +1,4 @@
-package org.qortal.network;
+package org.qortal.network.reticulum;
 
 import io.reticulum.Reticulum;
 import io.reticulum.Transport;
@@ -22,6 +22,7 @@ import lombok.Data;
 import lombok.Synchronized;
 
 import org.apache.commons.lang3.StringUtils;
+import org.qortal.network.Peer;
 import org.qortal.network.message.*;
 import org.qortal.repository.DataException;
 import org.qortal.settings.Settings;

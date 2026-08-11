@@ -1,4 +1,4 @@
-package org.qortal.network;
+package org.qortal.network.reticulum;
 
 //import org.slf4j.Logger;
 //import org.slf4j.LoggerFactory;
@@ -34,8 +34,8 @@ import static io.reticulum.identity.IdentityKnownDestination.recall;
 //import static io.reticulum.identity.IdentityKnownDestination.recallAppData;
 import io.reticulum.buffer.Buffer;
 import io.reticulum.buffer.BufferedRWPair;
-import org.qortal.network.RNSCommon.PeerAspect;
-import org.qortal.network.RNSCommon.PeerMetaType;
+import org.qortal.network.reticulum.RNSCommon.PeerAspect;
+import org.qortal.network.reticulum.RNSCommon.PeerMetaType;
 import static io.reticulum.utils.IdentityUtils.concatArrays;
 
 import lombok.Getter;
@@ -43,6 +43,10 @@ import org.qortal.controller.Controller;
 import org.qortal.data.block.BlockSummaryData;
 import org.qortal.data.block.CommonBlockData;
 import org.qortal.data.network.PeerData;
+import org.qortal.network.Handshake;
+import org.qortal.network.Network;
+import org.qortal.network.Peer;
+import org.qortal.network.PeerCtor;
 import org.qortal.network.helper.PeerCapabilities;
 import org.qortal.network.helper.PeerDownloadSpeedTracker;
 import org.qortal.network.message.Message;
