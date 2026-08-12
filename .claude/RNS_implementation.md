@@ -7,58 +7,87 @@
 
 ---
 
-## Status — all 11 phases landed, runtime verification outstanding
+## Status — 12 phases landed, first node run done, 24 h soak outstanding
 
-Last updated at `492c9a67`. Every phase in the table below is committed; the plan
+Last updated at `f6b5d5d5`. Every phase in the table below is committed; the plan
 document is now a record of what was done and why, not a forward plan.
 
 | | |
 |---|---|
-| `RNS.java` | 2610 → **857 L** (−67 %) |
-| Reticulum package | 12 main files, 3538 L total (was 1 file of 2610 L + 3 companions) |
+| `RNS.java` | 2610 → **873 L** (−67 %) |
+| Reticulum package | 12 main files, 4560 L total (2914 L excluding `ReticulumPeer.java`, which was only moved) |
 | Tests | 4 classes, **50 cases**, all green |
 | Behaviour changes | 19, all registered in §9 |
 | §10 comments | all present, grep-verified per phase |
 
 **What is not done.** Two items in §13 are unmet, and neither is a code defect:
 
-1. **`RNS.java` is 857 L, not ≤ 300.** The line budget assumed the facade would
+1. **`RNS.java` is 873 L, not ≤ 300.** The line budget assumed the facade would
    shed `QAnnounceHandler` (~140 L) and the peer add/remove methods; no phase in
    the table ever did that. See "Next step" below.
-2. **No node has been run since phase 8.** Phases 9–11 are compile-and-unit-test
-   verified only. §11.2 asks for a run after phase 10 specifically, and phase 11
-   changed the tick rate — both need a live node before this branch merges.
+2. **The 24 h soak.** A node has now run at the phase-11 state and phases 9–11
+   behave (§14), but §11.2's longer checks — thread-count stability, no CME/NPE
+   over hours, clean shutdown — still need a sustained run, now at the phase-12
+   state.
 
 **Next step, in priority order.**
 
-1. **Run a node** (§11.2, checks 1–6, ≥ 1 h; ≥ 24 h before merge). This is the
-   gate on everything else. Phase 10 is the highest-risk change in the plan and
-   has never executed. Specifically worth watching: DATA peers connect and QDN
-   transfers work; `/peers/reticulum` shows both aspects; thread count stable at
-   4 aspect executors (`jcmd <pid> Thread.print | grep -c "RNS-\|rnsMesh-"`);
-   `stop.sh` reaches `shutdown of Reticulum complete`. Note the announce change
-   (§9 item 4): a node sitting exactly at its peer target now stops announcing.
-2. **Phase 12 — visibility (small, mechanical).** 11 of `RNS`'s public members
+1. **Soak the node at the phase-12 state** (§11.2 checks 4–6, ≥ 24 h). The short
+   checks passed (§14); what is left is duration: thread count stable at 4 aspect
+   executors (`jcmd <pid> Thread.print | grep -c "RNS-\|rnsMesh-"`), no CME/NPE,
+   `stop.sh` reaching `shutdown of Reticulum complete`. Phase 12 changed a
+   hot-path branch in `sendMessage`, so it wants its own run rather than
+   inheriting the phase-11 result. Two things to read for: DATA reconnect should
+   now be visibly faster after a DATA peer drops (§14 finding 1), and a dying
+   peer should produce **one** "marking for removal" warning, not eight.
+2. **Phase 13 — visibility (small, mechanical).** 10 of `RNS`'s public members
    have zero callers outside `org.qortal.network.reticulum`:
    `baseClientConnected`, `dataClientConnected`, `getAnnouncedVersion`,
    `addLinkedPeer`, `removePeer`, `removeLinkedPeer`, `addIncomingPeer`,
    `onIncomingPeerIdentified`, `removeIncomingPeer`,
-   `getActiveImmutableLinkedPeers`, `triggerImmediateDataAnnounce`. Dropping them
-   to package-private costs nothing and makes the real external surface visible
-   in the code rather than only in this document — 13 members, verified by grep
-   over `src/main` + `src/test` outside the package: `getInstance`, `start`,
-   `shutdown`, `prunePeers`, `isMeshStarted`, `broadcast`, `isUnreachable`,
+   `getActiveImmutableLinkedPeers`. Dropping them to package-private costs
+   nothing and makes the real external surface visible in the code rather than
+   only in this document — 13 members, verified by grep over `src/main` +
+   `src/test` outside the package: `getInstance`, `start`, `shutdown`,
+   `prunePeers`, `isMeshStarted`, `broadcast`, `isUnreachable`,
    `getAllKnownPeers`, `getActiveDataPeers`, `getImmutableLinkedPeers`,
    `getImmutableIncomingPeers`, `getMessageMagic`, `onPeersV2Message`. (§5
    predicted 18; the difference is `triggerImmediateAnnounce`, `confirmPeerHash`
-   and `dedupIncomingPeerByIdentity`, which turned out to be called only from
-   `ReticulumPeer` — same package — plus the two destination getters.)
-3. **Phase 13 — the ≤ 300 L facade**, only if it is still wanted after 1 and 2.
+   and `dedupIncomingPeerByIdentity`, called only from `ReticulumPeer` — same
+   package — plus the two destination getters. Phase 12 already made
+   `triggerImmediateAnnounce` package-private and deleted
+   `triggerImmediateDataAnnounce`.)
+3. **Phase 14 — the ≤ 300 L facade**, only if it is still wanted after 1 and 2.
    `QAnnounceHandler` is the obvious extraction (~140 L, self-contained, one
    `Transport` registration); the `*ClientConnected` callbacks and the peer
    add/remove methods are another ~180 L that would belong with the registry.
    This is optional cosmetics next to items 1 and 2 — the duplication and
    concurrency problems the refactor set out to fix are already gone.
+
+---
+
+## 14. Findings from the first node run (phase 11 state, fixed in phase 12)
+
+The run confirmed the mechanical parts: both runners alive on their own threads,
+`logInterfaceStatus` emitting the interface block once rather than twice, the
+§9 item 4 announce condition firing as `<` (`Active DATA peers (5) < desired peers
+(8)`), the phase-9 pruner census on its 90 s cycle, and — direct evidence for
+phase 11 — `requesting paths to 13 known peers` followed by *zero* per-target
+`Path to …: hops=` lines. `DATA announce attempt completed in 1ms`: no `jobsLock`
+contention.
+
+Reading the same logs surfaced three defects, all older than this refactor:
+
+| # | Defect | Why it survived |
+|---|---|---|
+| 1 | `triggerImmediateDataAnnounce()` had **zero callers** — both kick sites called the BASE-only variant regardless of aspect, so a dropped DATA peer woke the wrong loop and DATA waited out its full 30 s window | The BASE/DATA duplication this plan removed is exactly what hid it: the DATA kick was written and then never wired |
+| 2 | One teardown queued and logged **per concurrent sender**: 8 "buffer closed" warnings and 4 disconnects for a single peer inside one second, each queueing a full `makePeerUnavailable` + remove + kick | Idempotent, so it never broke anything — only visible as log noise until someone read the timestamps |
+| 3 | Three log lines identified inbound peers by `destinationHash`, which for an inbound peer is **our** destination — eight failures on different peers all printed the same hash as our own DATA announce | `RNSPeerRegistry.incomingIdentityKey()` documents this trap; the log lines predate it |
+
+The lesson for the register in §9: none of these is a behaviour change anyone
+would have caught by reading a diff. They came from reading a running node's
+output against expectations — which is why §11.2 exists and why skipping it after
+phase 8 was a mistake.
 
 ---
 
@@ -79,7 +108,7 @@ Planned, with **as-built** line counts alongside the estimate:
 ```
 src/main/java/org/qortal/network/
 ├── reticulum/                              planned   as built
-│   ├── RNS.java                    facade    ~250 L     857 L   ← §13 miss, see Status
+│   ├── RNS.java                    facade    ~250 L     873 L   ← §13 miss, see Status
 │   ├── RNSCommon.java              unchanged  ~50 L      52 L
 │   ├── ReticulumPeer.java          moved only 1633 L    1646 L   out of scope for this plan
 │   ├── ReticulumPeerAddress.java   moved only   71 L      73 L
@@ -123,6 +152,7 @@ documentation it needed once it stood alone.
 | 9 | ✅ `cda0c7a0` | `RNSPeerPruner` + 14 tests | low–medium | −132 (→1437) |
 | 10 | ✅ `6bf85e93` + `b29ea96d` | `ReconnectPolicy` + `RNSAspectRunner`, BASE then DATA | **highest** | −583 (→854) |
 | 11 | ✅ `993f2351` | 10 ms → 50 ms tick, INFO → DEBUG | low | ~0 |
+| 12 | ✅ `f6b5d5d5` | three defects found by the first node run (§14) | low | +14 |
 
 Phases 1–7 are ~60 % of the reduction at near-zero risk and can ship before any decision on 8–10.
 
@@ -768,7 +798,7 @@ Capture a baseline of 3–6 on the current build **before** starting phase 1, so
 ## 13. Definition of done
 
 - ❌ `src/main/java/org/qortal/network/reticulum/RNS.java` ≤ 300 lines, no `@Data`, no setters, 18-member public surface.
-  **857 L.** `@Data`, the setters and the live-list getters are gone (phase 3) and the *externally used* surface is 8 members, but 11 more are still `public` for no reason and the class still holds `QAnnounceHandler`. Phases 12/13 in Status.
+  **873 L.** `@Data`, the setters and the live-list getters are gone (phase 3) and the *externally used* surface is 8 members, but 11 more are still `public` for no reason and the class still holds `QAnnounceHandler`. Phases 12/13 in Status.
 - ✅ No `runDataLoop`; one `RNSAspectRunner` class instantiated twice; no `data*` mirror fields. Grep-verified (§11.1).
 - ✅ `RNSAnnounceCodecTest` green, ≥ 10 cases, covering legacy QGW1 and truncation. 18 cases; 50 across the package.
 - ✅ Every comment in §10 present in the new tree (grep-verified after each extraction phase).
