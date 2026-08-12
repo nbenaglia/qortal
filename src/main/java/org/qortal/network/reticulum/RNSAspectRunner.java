@@ -107,8 +107,9 @@ final class RNSAspectRunner {
     private volatile int consecutiveStuckTasks = 0;
 
     /**
-     * @param messageTaskType    {@code Peer.NETWORK} or {@code Peer.NETWORKDATA} — which queue the
-     *                           drain pass pulls from
+     * @param messageTaskType    which queue the drain pass pulls from: {@code Peer.NETWORK} routes
+     *                           to {@code Network.onMessage()}, {@code Peer.NETWORKDATA} routes to
+     *                           {@code NetworkData.onMessage()}
      * @param peerFactory        creates and tracks an initiator peer of this aspect from a cached
      *                           identity; the side effects stay in {@code RNS}
      * @param logInterfaceStatus whether to log per-interface online status each reconnect cycle.
