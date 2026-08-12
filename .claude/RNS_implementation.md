@@ -56,7 +56,7 @@ src/main/java/org/qortal/network/
 | 7 | ✅ `9b0b2a62` | `RNSGatewayManager` + dialling off the announce thread (§5.4) | low | −175 (→1701) |
 | 8 | ✅ `9e234e80` | `RNSPeerRegistry` + 16 tests | **medium** | −132 (→1569) |
 | 9 | ✅ `cda0c7a0` | `RNSPeerPruner` + 14 tests | low–medium | −132 (→1437) |
-| 10 | `rns: unify BASE/DATA into RNSAspectRunner` | closes the DATA robustness gap | **highest** | −520 |
+| 10 | ✅ `6bf85e93` + `b29ea96d` | `ReconnectPolicy` + `RNSAspectRunner`, BASE then DATA | **highest** | −583 (→854) |
 | 11 | `rns: reduce poll rate and hot-path logging` | 10 ms → 50 ms tick, INFO → DEBUG | low | ~0 |
 
 Phases 1–7 are ~60 % of the reduction at near-zero risk and can ship before any decision on 8–10.
@@ -569,17 +569,32 @@ Everything here is deliberate. Anything else that changes behaviour is a regress
 | 9 | Loop tick 10 ms → 50 ms | 11 | ~200 peer-list traversals/s at idle for ≤ 10 ms of latency | idle CPU of `rnsMesh-*` threads drops |
 | 10 | Per-peer reconnect INFO → DEBUG | 11 | ~100 INFO lines per 15 s cycle with 50 known peers (~24 k/h) | log volume |
 | 11 | `isUnreachable` returns `boolean` | 9 | §5.7 | none |
+| 15 | `ReconnectPolicy.evictOlderThan(24 h)` per reconnect cycle | 10 | §5.5 — the failure maps only ever grew | a peer quiet for a day restarts from the 60 s base window |
+| 16 | The reconnect pass tests "already tracked" against the live registry, not a list captured before the task was submitted | 10 | a peer added in between was dialled and then deduped by `addLinked` | one fewer wasted LINKREQUEST per race |
+| 17 | Announce/reconnect executor threads renamed `RNS-<aspect>-Announce` / `-Reconnect` | 10 | one naming rule for two instances | `jcmd Thread.print`; `RNS-` prefix greps still match |
+| 18 | `shutdown()` stops each loop thread **and its executors** before peer teardown, not after | 10 | a reconnect task must not create links while shutdown closes them | shutdown log ordering |
 | 12 | Zero-caller public methods removed | 1 | §3.3 | none in-tree; note for any out-of-tree consumer |
 | 13 | `shutdown()` tolerates a mesh that never started | 4 | `start()` can now return early, and Controller calls `shutdown()` unconditionally — without this the guard in §6.4 would just move the NPE | "Reticulum mesh was not started — closing worker threads only" |
 | 14 | Snapshot fields are `volatile` | 3 | written by mutators, read by every consumer thread; the `@Data` getter provided no barrier | none observable |
 
 **Runtime verification.** A node was run at the phase-5 state (`9e9d8737`) — mesh forms, peers connect, Reticulum working normally. Phases 6–7 changed startup ordering (the peer stores are built in `start()`, not the constructor) and the gateway-dial threading, so **re-run a node before phase 8** and check: known-peer hashes still load at startup ("Loaded N known BASE peer hashes"), `/peers/reticulum` fills as before, and any dynamic gateway add now logs from the `RNS-GatewayDial` thread.
 
-**Test placement.** Reticulum tests live in `org.qortal.test.network.reticulum` (`RNSAnnounceCodecTest`, `RNSNetworkTest`, `RNSPeerFactoryScanTest`). The exceptions are `RNSPeerRegistryTest` and `RNSPeerPrunerTest`, in `org.qortal.network.reticulum` under `src/test` — both classes are package-private *on purpose*, since that visibility is what enforces "only RNS mutates the peer lists", and a same-package test is the only way to reach them without making the classes public. The repo already has this pattern (`src/test/java/org/qortal/controller`).
+**Test placement.** The Reticulum unit tests live in `org.qortal.network.reticulum` under `src/test` (`RNSAnnounceCodecTest`, `RNSPeerFactoryScanTest`, `RNSPeerRegistryTest`, `RNSPeerPrunerTest`) — `RNSPeerRegistry` and `RNSPeerPruner` are package-private *on purpose*, since that visibility is what enforces "only RNS mutates the peer lists", and a same-package test is the only way to reach them without making the classes public. The repo already has this pattern (`src/test/java/org/qortal/controller`). `RNSNetworkTest`, which is an integration-style test rather than a unit test, stays in `org.qortal.test.network`.
 
 **Testability fix, phase 8.** `ReticulumPeer.APP_NAME` (a `static final` reading `Settings`) forced the settings file, `BlockChain` and the crypto stack to load during class initialisation — mocking the class failed with `NoClassDefFoundError: NullAccount`, root-caused to `RIPEMD160 message digest not available`. It is now `appName()`, resolved on use. Only `initPeerLink()` ever read it. `RNS` has the same pattern in its own `APP_NAME`; harmless today (nothing mocks `RNS`) but worth the same treatment if it ever needs testing.
 
 **Deviation, phase 7.** `@Synchronized` on `receivedAnnounce` is **kept**, not removed as §7.3 anticipated. What the analysis objected to was holding it across a TCP connect; that is fixed by moving the dial to an executor. The lock itself is cheap, and dropping it would let two announces for the same aspect race the `activePeerCount < peerLimit` check — harmless (`addLinkedPeer` dedups atomically) but a real concurrency change with no upside. Its limits are now documented at the annotation.
+
+**Notes, phase 10.** Landed as the two commits §8.4 asks for: `6bf85e93` wires BASE only and leaves `runDataLoop` untouched (revertable, and the state to run a node at), `b29ea96d` wires DATA and deletes the duplicate.
+
+Deviations from §8.4's sketch:
+
+- **`aspectName` is not a constructor parameter.** Nothing in the runner needs it — `registry.activeIncomingHashes(aspect)` derives it itself. Two parameters were added instead: `logInterfaceStatus` (interface state is transport-wide, so only BASE logs it — otherwise the line rate simply doubles) and `threadPriority` (the runner builds its own executors, so it needs what the `RNS` constructor used to read from `Settings`).
+- **`peerFactory` is one method, not two.** `createLinkedPeerFromIdentity` takes the aspect; `new ReticulumPeer(dhash)` was already `new ReticulumPeer(dhash, BASE)`.
+- **§8.4's `announce()` snippet contradicts §9 item 4** — it shows `if (count > minDesiredPeers) return;`, which is the old `<=` behaviour. §9 is authoritative per rule 3, so the code is `if (count >= minDesiredPeers) return;`. Worth a look on a live node: at exactly the peer target a node now stops announcing, which is the intended traffic saving but also makes it marginally less discoverable.
+- **The watchdog helper takes `nowMs`** as well as the four planned parameters, and the "is a task already running" test is a `compareAndSet(0, nowMs)` rather than a read-then-write — the loop thread is the only writer, so this is defensive rather than a fix.
+
+`RNS.java` is 854 L, not the ~250 L of §1. What remains is the facade proper (lifecycle, the singleton, the public API), plus `QAnnounceHandler` (~140 L), the two `*ClientConnected` callbacks, and the peer add/remove methods whose bodies are mostly the §10 comments. Splitting those out was never in the phase table; §13's "≤ 300 lines" is not met and would need a phase 12 to reach.
 
 **Notes, phase 9.** Two behaviour-neutral simplifications beyond the plan: the before/after census reads `registry.activeIncoming().size()` instead of `incoming.size() - nonActiveIncoming().size()` (exact complements — one traversal, not two), and the silent-peer pass iterates `registry.activeIncoming()` instead of filtering `incoming()` by `status == ACTIVE` inline. Log text is unchanged. `RNS.getNonActiveIncomingPeers()` is deleted: after the extraction it had zero callers, and `registry.nonActiveIncoming()` is the accessor. `java.time.Duration` and the `LinkStatus.PENDING` static import leave `RNS.java` with the prune code — nothing else in the facade used either.
 
