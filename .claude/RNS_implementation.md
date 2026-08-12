@@ -54,10 +54,10 @@ is now a record of what was done and why, not a forward plan.
    the 24 h question — the code path is unreachable below 24 h uptime, and a
    soak would only show it not crashing, not that it evicted the right entries.
 3. **Re-run briefly to confirm `12a`.** The soak predates the `linkClosed` guard.
-   `grep "Disconnecting peer" | sed -E 's/^(.{19}) .*peer ([^ ]+).*/\1 \2/' |
-   sort | uniq -c` should now show every count as 1. §14.2 findings 2 and 3
-   (duplicate peer instances, interface-log volume) remain open and are worth
-   reading for on the same run.
+   The baseline is **41 doubled closures out of 158 (26 %)**, so this is a clean
+   pass/fail rather than a judgement call — the duplicate-group count in §14.2
+   must come back **0**. §14.2 findings 2 and 3 (duplicate peer instances,
+   interface-log volume) remain open and are worth reading for on the same run.
 4. **Phase 13 — visibility (small, mechanical).** 10 of `RNS`'s public members
    have zero callers outside `org.qortal.network.reticulum`:
    `baseClientConnected`, `dataClientConnected`, `getAnnouncedVersion`,
@@ -155,10 +155,45 @@ healthy aspect, not a stalled runner — BASE logged 2, DATA 707.
 
 | # | Finding | Status |
 |---|---|---|
-| 1 | `linkClosed()` had **no claim guard** — the library invokes the callback more than once per Link (`Link.teardown()` sets `status=CLOSED` and calls `linkClosed()` unguarded; `teardownPacket()` calls it too), so `shutdownChannel()`, `disconnect()` and `triggerImmediateAnnounce()` all ran twice. Seen as two full disconnect sequences 1 ms apart for link `6bd125a4` (connection ages 12175141 / 12175142). The `closedLinkHandled` flag for exactly this existed since phase 12 but was referenced only from `sendMessage` | **fixed** — §9 item 20 |
-| 2 | Two `ReticulumPeer` instances for one remote: concurrent initiator links `0d2b0aaf` and `fc9f8e98` to `4a24e3d9`. `claimRemoval()` is a CAS, so both legitimately claimed — this is what produced the 2 non-singleton teardowns, not a dedup failure. `isLinkedTracked` (`RNSAspectRunner.java:387`) is meant to prevent it | open, pre-existing, 2 occurrences in 6 h |
+| 1 | `linkClosed()` had **no claim guard**, so a single link closure ran the whole teardown — `shutdownChannel()`, `disconnect()`, `triggerImmediateAnnounce()` — once per timed-out packet. **41 of 158 real closures (26 %) were processed twice.** Root cause below | **fixed** — §9 item 20 |
+| 2 | Two `ReticulumPeer` instances for one remote: concurrent initiator links `0d2b0aaf` and `fc9f8e98` to `4a24e3d9`. `claimRemoval()` is a CAS, so both legitimately claimed — this is what produced the 2 non-singleton `marking for removal` lines (a different metric from finding 1's `Disconnecting peer` count), not a dedup failure. `isLinkedTracked` (`RNSAspectRunner.java:387`) is meant to prevent it | open, pre-existing, 2 occurrences in 6 h |
 | 3 | The interface-status block is **4 lines per 15 s**, not the "one or two" the phase-11 note claims — 5920 lines, ~20 % of the log, none ever changing value. Logging on transition (with a periodic line only while something is offline) satisfies the stated justification | open, cosmetic |
 | 4 | 3 × `MessageException: Message checksum incorrect` (13:06, 16:23, 17:42, three different peers). `ReticulumPeer.java:859` assumes one `buf.read()` yields exactly one whole `Message`. The handler is deliberately non-fatal and all three peers carried on — one for 43 min, one to the end of the run | open, pre-existing, predates the refactor |
+
+**Finding 1, root cause.** `Channel.packetTimeout()` is a *per-packet* callback
+(`Channel.java:369`). Every in-flight packet that exhausts `maxTries` logs
+`Retry count exceeded`, then at `Channel.java:414-417` runs
+`shutdown(); outlet.timedOut();`. So N packets in flight on one dying link give:
+
+> N × `packetTimeout` → N × `outlet.timedOut()` → N × `Link.teardown()` → N × `linkClosed()`
+
+and `Link.teardown()` (`Link.java:754-767`) has no already-CLOSED guard to swallow
+the repeats. Measured over the run: **124** `Retry count exceeded`, **45** of them
+same-second bursts, against **41** doubled closures — near 1:1, the gap being
+bursts that span *different* links (17:18:56 tore down three separate peers, three
+correct singletons). Clearest single case is 17:18:50: two retry-exceeded lines,
+then two full disconnect sequences 1 ms apart for link `6bd125a4` (connection ages
+12175141 / 12175142). The `closedLinkHandled` flag for exactly this existed since
+phase 12 but was referenced only from `sendMessage`.
+
+Two consequences worth carrying forward. First, 124 retry-exhaustions against 158
+real closures means **Channel retry exhaustion is the normal way a link dies on
+this mesh**, not an exceptional one — this path deserves the scrutiny. Second, the
+re-run check is now quantitative rather than anecdotal: against a 26 % baseline,
+
+```bash
+grep "Disconnecting peer" qortal.log \
+  | sed -E 's/^(.{19}) .*peer ([^ ]+).*/\1 \2/' | sort | uniq -c | awk '$1>1' | wc -l
+```
+
+must return **0** on a run at `12a`.
+
+A related library-side artefact, not worth chasing: `Packet:507 No interfaces
+could process (resend)` + `LinkChannelOutlet:49 Failed to resend packet` is one
+event, a sibling envelope resending in the window between retry-exhaustion and the
+link reaching CLOSED. `Channel.java:379-387` already guards this with
+`outlet.isClosed()`, but teardown runs after `packetTxOp` returns, so the guard
+narrows the race without closing it.
 
 Findings 1 and 3 repeat §14.1's lesson: both are invisible in a diff and obvious
 in a log. Finding 1 in particular was *introduced as a fix* in phase 12 and then
@@ -747,7 +782,7 @@ Everything here is deliberate. Anything else that changes behaviour is a regress
 | 12 | Zero-caller public methods removed | 1 | §3.3 | none in-tree; note for any out-of-tree consumer |
 | 13 | `shutdown()` tolerates a mesh that never started | 4 | `start()` can now return early, and Controller calls `shutdown()` unconditionally — without this the guard in §6.4 would just move the NPE | "Reticulum mesh was not started — closing worker threads only" |
 | 14 | Snapshot fields are `volatile` | 3 | written by mutators, read by every consumer thread; the `@Data` getter provided no barrier | none observable |
-| 20 | `linkClosed()` claims its handling once per peer instance | 12a | the library calls the callback more than once per Link — `Link.teardown()` sets `status=CLOSED` and calls `linkClosed()` with no already-closed guard, and `teardownPacket()` calls it too | one `Disconnecting peer … reason: link closed` triple per closure, not two (§14.2 finding 1) |
+| 20 | `linkClosed()` claims its handling once per peer instance | 12a | the library calls the callback once **per timed-out packet**, not per link: `Channel.packetTimeout` → `outlet.timedOut()` → `Link.teardown()`, which has no already-closed guard. 26 % of closures ran the full teardown twice | same-second duplicate `Disconnecting peer … reason: link closed` groups drop from 41-of-158 to zero (§14.2 finding 1) |
 
 **Runtime verification.** A node was run at the phase-5 state (`9e9d8737`) — mesh forms, peers connect, Reticulum working normally. Phases 6–7 changed startup ordering (the peer stores are built in `start()`, not the constructor) and the gateway-dial threading, so **re-run a node before phase 8** and check: known-peer hashes still load at startup ("Loaded N known BASE peer hashes"), `/peers/reticulum` fills as before, and any dynamic gateway add now logs from the `RNS-GatewayDial` thread.
 
