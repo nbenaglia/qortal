@@ -55,7 +55,7 @@ src/main/java/org/qortal/network/
 | 6 | ✅ `92eec531` | `KnownPeerStore` ×2 + `RNSConfigWriter` | low | −170 (→1876) |
 | 7 | ✅ `9b0b2a62` | `RNSGatewayManager` + dialling off the announce thread (§5.4) | low | −175 (→1701) |
 | 8 | ✅ `9e234e80` | `RNSPeerRegistry` + 16 tests | **medium** | −132 (→1569) |
-| 9 | `rns: extract RNSPeerPruner` | 4 passes → 4 methods | low–medium | −160 |
+| 9 | ✅ `cda0c7a0` | `RNSPeerPruner` + 14 tests | low–medium | −132 (→1437) |
 | 10 | `rns: unify BASE/DATA into RNSAspectRunner` | closes the DATA robustness gap | **highest** | −520 |
 | 11 | `rns: reduce poll rate and hot-path logging` | 10 ms → 50 ms tick, INFO → DEBUG | low | ~0 |
 
@@ -456,6 +456,11 @@ One instance **per aspect**. Today `pendingFailureCount` is shared between aspec
 
 ```java
 final class RNSPeerPruner {
+    RNSPeerPruner(RNSPeerRegistry registry,
+                  Consumer<ReticulumPeer> removeLinkedPeer,
+                  Consumer<ReticulumPeer> removeIncomingPeer,
+                  BiConsumer<String, PeerAspect> recordPendingFailure);
+
     void prune();                                  // logs before/after counts, calls the four passes
     private void pruneInitiatorPeers();            // timed-out / unreachable-ACTIVE / CLOSED / stuck-PENDING
     private void pruneNonActiveIncoming();
@@ -464,6 +469,14 @@ final class RNSPeerPruner {
     static boolean isUnreachable(ReticulumPeer p); // boxed Boolean → primitive (§5.7)
 }
 ```
+
+The pruner decides *which* peers go; the two `Consumer` callbacks are `RNS::removeLinkedPeer` /
+`RNS::removeIncomingPeer`, so every side effect (`shutdownChannel`, `closeIfActive`,
+`makePeerUnavailable`) stays in `RNS` and rule 4 of §0 holds without the pruner knowing about
+Reticulum or `Network` at all. `recordPendingFailure` is a new aspect-keyed overload on `RNS`
+delegating to the existing `(String, ConcurrentHashMap)` one — the pruner no longer needs to know
+that the two aspects use separate time maps, which is what `ReconnectPolicy` (§8.2) will absorb in
+phase 10.
 
 Each pass takes one snapshot at its start instead of recomputing `getActiveImmutableLinkedPeers()` / `getNonActiveIncomingPeers()` seven times per cycle (§6.3 of the analysis).
 
@@ -562,11 +575,13 @@ Everything here is deliberate. Anything else that changes behaviour is a regress
 
 **Runtime verification.** A node was run at the phase-5 state (`9e9d8737`) — mesh forms, peers connect, Reticulum working normally. Phases 6–7 changed startup ordering (the peer stores are built in `start()`, not the constructor) and the gateway-dial threading, so **re-run a node before phase 8** and check: known-peer hashes still load at startup ("Loaded N known BASE peer hashes"), `/peers/reticulum` fills as before, and any dynamic gateway add now logs from the `RNS-GatewayDial` thread.
 
-**Test placement.** Reticulum tests live in `org.qortal.test.network.reticulum` (`RNSAnnounceCodecTest`, `RNSNetworkTest`, `RNSPeerFactoryScanTest`). The one exception is `RNSPeerRegistryTest`, in `org.qortal.network.reticulum` under `src/test` — `RNSPeerRegistry` is package-private *on purpose*, since that visibility is what enforces "only RNS mutates the peer lists", and a same-package test is the only way to reach it without making the class public. The repo already has this pattern (`src/test/java/org/qortal/controller`).
+**Test placement.** Reticulum tests live in `org.qortal.test.network.reticulum` (`RNSAnnounceCodecTest`, `RNSNetworkTest`, `RNSPeerFactoryScanTest`). The exceptions are `RNSPeerRegistryTest` and `RNSPeerPrunerTest`, in `org.qortal.network.reticulum` under `src/test` — both classes are package-private *on purpose*, since that visibility is what enforces "only RNS mutates the peer lists", and a same-package test is the only way to reach them without making the classes public. The repo already has this pattern (`src/test/java/org/qortal/controller`).
 
 **Testability fix, phase 8.** `ReticulumPeer.APP_NAME` (a `static final` reading `Settings`) forced the settings file, `BlockChain` and the crypto stack to load during class initialisation — mocking the class failed with `NoClassDefFoundError: NullAccount`, root-caused to `RIPEMD160 message digest not available`. It is now `appName()`, resolved on use. Only `initPeerLink()` ever read it. `RNS` has the same pattern in its own `APP_NAME`; harmless today (nothing mocks `RNS`) but worth the same treatment if it ever needs testing.
 
 **Deviation, phase 7.** `@Synchronized` on `receivedAnnounce` is **kept**, not removed as §7.3 anticipated. What the analysis objected to was holding it across a TCP connect; that is fixed by moving the dial to an executor. The lock itself is cheap, and dropping it would let two announces for the same aspect race the `activePeerCount < peerLimit` check — harmless (`addLinkedPeer` dedups atomically) but a real concurrency change with no upside. Its limits are now documented at the annotation.
+
+**Notes, phase 9.** Two behaviour-neutral simplifications beyond the plan: the before/after census reads `registry.activeIncoming().size()` instead of `incoming.size() - nonActiveIncoming().size()` (exact complements — one traversal, not two), and the silent-peer pass iterates `registry.activeIncoming()` instead of filtering `incoming()` by `status == ACTIVE` inline. Log text is unchanged. `RNS.getNonActiveIncomingPeers()` is deleted: after the extraction it had zero callers, and `registry.nonActiveIncoming()` is the accessor. `java.time.Duration` and the `LinkStatus.PENDING` static import leave `RNS.java` with the prune code — nothing else in the facade used either.
 
 **Running notes (phases 1–5, as landed).** `mvn test` needs network access the first time — surefire's `junit-platform` provider is not in the local repo, and `-o` fails on it. Tests run with
 `mvn -DskipTests -DskipJUnitTests=false -Dtest=RNSAnnounceCodecTest test` (the pom wires `<skipTests>` to the `skipJUnitTests` property, so `-DskipTests` alone does not control it).
