@@ -1,7 +1,6 @@
-package org.qortal.test.network.reticulum;
+package org.qortal.network.reticulum;
 
 import org.junit.jupiter.api.Test;
-import org.qortal.network.reticulum.RNSAnnounceCodec;
 import org.qortal.network.reticulum.RNSAnnounceCodec.AnnounceInfo;
 
 import java.nio.ByteBuffer;

@@ -1,4 +1,4 @@
-package org.qortal.test.network.reticulum;
+package org.qortal.network.reticulum;
 
 import org.junit.jupiter.api.Test;
 import org.qortal.network.Peer;
