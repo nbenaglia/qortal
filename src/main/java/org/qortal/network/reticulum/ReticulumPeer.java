@@ -555,7 +555,7 @@ public class ReticulumPeer implements Peer {
     }
 
     public void disconnect(String reason) {
-        log.info("@@@-> Disconnecting peer {} after {} - reason: {}", this.toString(), getConnectionAge(), reason);
+        log.info("Disconnecting peer {} after {} - reason: {}", this.toString(), getConnectionAge(), reason);
         var isShuttingDown = RNS.getInstance().isShuttingDown();
         log.debug("ReticulumPeer disconnect, RNS isShuttingDown: {}", isShuttingDown);
         if (!isShuttingDown) {
@@ -727,6 +727,16 @@ public class ReticulumPeer implements Peer {
     }
     
     public void linkClosed(Link link) {
+        // The library invokes this callback more than once for a single Link: Link.teardown() sets
+        // status=CLOSED and calls linkClosed() with no already-closed guard, and teardownPacket()
+        // calls it too. A live run showed two full disconnect sequences 1ms apart for one link id
+        // (same peer, connection ages 12175141/12175142) — each running shutdownChannel(), disconnect()
+        // and a duplicate triggerImmediateAnnounce() kick. Claim the handling once; the removal itself
+        // was already idempotent via markPeerForImmediateRemoval() → claimRemoval().
+        // Safe as a one-shot per peer instance: peerLink is assigned only in the constructors and is
+        // never reassigned, so a peer owns exactly one link for its lifetime. Shares the flag with
+        // sendMessage's CLOSED branch on purpose — same event, whichever path notices first wins.
+        if (!claimClosedLinkHandling()) return;
         if (isInitiator) {
             // Null the buffer immediately so createPeerBuffer() works correctly if this peer's
             // link is re-initiated before prunePeers() calls removeLinkedPeer() → shutdownChannel().
@@ -921,7 +931,6 @@ public class ReticulumPeer implements Peer {
                         break;
                 }
             } catch (MessageException e) {
-                //log.error("{} from peer {}", e.getMessage(), this);
                 log.error("peerBufferReady - {} from peer {}", e, this);
                 // don't take any chances:
                 // can happen if link is closed by peer in which case we close this side of the link
