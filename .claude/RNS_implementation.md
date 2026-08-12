@@ -57,7 +57,7 @@ src/main/java/org/qortal/network/
 | 8 | ✅ `9e234e80` | `RNSPeerRegistry` + 16 tests | **medium** | −132 (→1569) |
 | 9 | ✅ `cda0c7a0` | `RNSPeerPruner` + 14 tests | low–medium | −132 (→1437) |
 | 10 | ✅ `6bf85e93` + `b29ea96d` | `ReconnectPolicy` + `RNSAspectRunner`, BASE then DATA | **highest** | −583 (→854) |
-| 11 | `rns: reduce poll rate and hot-path logging` | 10 ms → 50 ms tick, INFO → DEBUG | low | ~0 |
+| 11 | ✅ `993f2351` | 10 ms → 50 ms tick, INFO → DEBUG | low | ~0 |
 
 Phases 1–7 are ~60 % of the reduction at near-zero risk and can ship before any decision on 8–10.
 
@@ -573,6 +573,7 @@ Everything here is deliberate. Anything else that changes behaviour is a regress
 | 16 | The reconnect pass tests "already tracked" against the live registry, not a list captured before the task was submitted | 10 | a peer added in between was dialled and then deduped by `addLinked` | one fewer wasted LINKREQUEST per race |
 | 17 | Announce/reconnect executor threads renamed `RNS-<aspect>-Announce` / `-Reconnect` | 10 | one naming rule for two instances | `jcmd Thread.print`; `RNS-` prefix greps still match |
 | 18 | `shutdown()` stops each loop thread **and its executors** before peer teardown, not after | 10 | a reconnect task must not create links while shutdown closes them | shutdown log ordering |
+| 19 | `QAnnounceHandler`'s per-peer "peer exists" / "peer link" lines INFO → DEBUG | 11 | that loop runs per received announce, and every peer announces every ~30 s | log volume; "added new ReticulumPeer" stays at INFO |
 | 12 | Zero-caller public methods removed | 1 | §3.3 | none in-tree; note for any out-of-tree consumer |
 | 13 | `shutdown()` tolerates a mesh that never started | 4 | `start()` can now return early, and Controller calls `shutdown()` unconditionally — without this the guard in §6.4 would just move the NPE | "Reticulum mesh was not started — closing worker threads only" |
 | 14 | Snapshot fields are `volatile` | 3 | written by mutators, read by every consumer thread; the `@Data` getter provided no barrier | none observable |
@@ -584,6 +585,8 @@ Everything here is deliberate. Anything else that changes behaviour is a regress
 **Testability fix, phase 8.** `ReticulumPeer.APP_NAME` (a `static final` reading `Settings`) forced the settings file, `BlockChain` and the crypto stack to load during class initialisation — mocking the class failed with `NoClassDefFoundError: NullAccount`, root-caused to `RIPEMD160 message digest not available`. It is now `appName()`, resolved on use. Only `initPeerLink()` ever read it. `RNS` has the same pattern in its own `APP_NAME`; harmless today (nothing mocks `RNS`) but worth the same treatment if it ever needs testing.
 
 **Deviation, phase 7.** `@Synchronized` on `receivedAnnounce` is **kept**, not removed as §7.3 anticipated. What the analysis objected to was holding it across a TCP connect; that is fixed by moving the dial to an executor. The lock itself is cheap, and dropping it would let two announces for the same aspect race the `activePeerCount < peerLimit` check — harmless (`addLinkedPeer` dedups atomically) but a real concurrency change with no upside. Its limits are now documented at the annotation.
+
+**Notes, phase 11.** Item 10's scope was "per-peer reconnect"; item 19 was added for `QAnnounceHandler`, which is the same class of problem (per-announce rather than per-cycle) and was the largest single INFO source left in `RNS.java` on a busy mesh. `hopsTo()` moved inside an `isDebugEnabled()` guard — it fed nothing but that log line. Deliberately left at INFO: the per-cycle interface online status (one or two lines per 15 s, and the first thing you read when the mesh is down), the announce timing lines that §11.2 checks, and everything in `RNSPeerPruner` — a peer removal is an event, not a poll.
 
 **Notes, phase 10.** Landed as the two commits §8.4 asks for: `6bf85e93` wires BASE only and leaves `runDataLoop` untouched (revertable, and the state to run a node at), `b29ea96d` wires DATA and deletes the duplicate.
 
