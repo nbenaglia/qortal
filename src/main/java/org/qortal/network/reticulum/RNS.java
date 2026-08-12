@@ -121,10 +121,24 @@ public class RNS {
         return aspect == RNSCommon.PeerAspect.DATA ? dataPolicy : basePolicy;
     }
 
-    /** Called by ReticulumPeer.linkClosed() to kick the announce/path-recovery cycle soon. */
-    public void triggerImmediateAnnounce() {
-        if (baseRunner != null) {   // null until start() has run
-            baseRunner.triggerImmediateAnnounce();
+    /** The runner for an aspect. Null-safe on aspect: an inbound peer's is set just after
+     *  construction, so a link closing in that window is treated as BASE, as it always was. */
+    private RNSAspectRunner runnerFor(RNSCommon.PeerAspect aspect) {
+        return aspect == RNSCommon.PeerAspect.DATA ? dataRunner : baseRunner;
+    }
+
+    /**
+     * Called when a peer's link closes, to kick that aspect's announce/path-recovery cycle within
+     * ~5s rather than waiting out its full 30s window.
+     * <p>
+     * The aspect matters: both call sites used to kick BASE unconditionally, and the DATA
+     * equivalent (a {@code triggerImmediateDataAnnounce()} that existed but had no callers) meant a
+     * dropped DATA peer accelerated nothing and woke the wrong loop.
+     */
+    void triggerImmediateAnnounce(RNSCommon.PeerAspect aspect) {
+        RNSAspectRunner runner = runnerFor(aspect);
+        if (runner != null) {   // null until start() has run
+            runner.triggerImmediateAnnounce();
         }
     }
 
@@ -256,13 +270,6 @@ public class RNS {
 
     public boolean isMeshStarted() {
         return meshStarted;
-    }
-
-    /** Kick the DATA announce/reconnect cycle within ~5s (mirrors triggerImmediateAnnounce()). */
-    public void triggerImmediateDataAnnounce() {
-        if (dataRunner != null) {   // null until start() has run
-            dataRunner.triggerImmediateAnnounce();
-        }
     }
 
     public void broadcast(Function<ReticulumPeer, Message> peerMessageBuilder) {
@@ -632,11 +639,19 @@ public class RNS {
 
     /**
      * Immediately remove a peer from the peer list and kick reconnect, rather than waiting
-     * for the next prunePeers() cycle (~60s). Called from ReticulumPeer.peerBufferReady()
-     * on read error. Runs on the rnsWorkerPool to avoid blocking the Reticulum callback thread.
+     * for the next prunePeers() cycle (~60s). Called from ReticulumPeer whenever a link or buffer
+     * turns out to be dead. Runs on the rnsWorkerPool to avoid blocking the Reticulum callback
+     * thread.
+     * <p>
+     * At most one teardown is queued per peer: every thread that tries to use a dying peer
+     * discovers the death independently, so the claim is what stops N concurrent senders queueing
+     * N identical teardowns and writing N identical warnings.
+     *
+     * @return true if this call claimed the teardown — callers use it to log once
      */
-    void markPeerForImmediateRemoval(ReticulumPeer peer) {
-        if (this.isShuttingDown) return;
+    boolean markPeerForImmediateRemoval(ReticulumPeer peer) {
+        if (this.isShuttingDown) return false;
+        if (!peer.claimRemoval()) return false;
         try {
             rnsWorkerPool.submit(() -> {
                 peer.makePeerUnavailable();
@@ -645,11 +660,12 @@ public class RNS {
                 } else {
                     removeIncomingPeer(peer);
                 }
-                triggerImmediateAnnounce(); // kick runBaseLoop to reconnect within ~5s
+                triggerImmediateAnnounce(peer.getPeerAspect()); // reconnect this aspect within ~5s
             });
         } catch (RejectedExecutionException e) {
             // Pool shut down — prunePeers() will clean up on next cycle
         }
+        return true;
     }
 
     public void addLinkedPeer(ReticulumPeer peer) {
