@@ -54,7 +54,13 @@ final class RNSAspectRunner {
     private static final long RECONNECT_INTERVAL_MS = 15_000L;   // reconnect independently of announce
     private static final long ANNOUNCE_TASK_TIMEOUT_MS = 60_000L; // watchdog: reset stuck announce after 60s
     private static final long RECONNECT_TASK_TIMEOUT_MS = 45_000L; // watchdog: reset stuck reconnect after 45s
-    private static final long LOOP_SLEEP_MS = 10L;
+    /**
+     * Loop tick. Each tick walks both peer lists for this aspect to drain message and ping tasks;
+     * at 10 ms that was ~100 traversals/s per runner while idle, for at most 10 ms of dispatch
+     * latency. 50 ms cuts that by 5× and is still far below anything a peer can notice — messages
+     * are dispatched to the worker pool, and the ping interval it also drives is 55 s.
+     */
+    private static final long LOOP_SLEEP_MS = 50L;
     private static final long THREAD_JOIN_MS = 5_000L;
     private static final long EXECUTOR_KEEPALIVE_S = 5L;
     /** Announce this soon after start when the peer store has hashes to reconnect to. */
@@ -386,9 +392,14 @@ final class RNSAspectRunner {
                 // precomputed activeIncomingHashes above.)
                 if (activeIncomingHashes.contains(hashHex)) continue;
                 // hopsTo() is a ConcurrentHashMap.get() — no lock, always safe.
-                int hops = Transport.getInstance().hopsTo(dhash);
-                log.info("Path to {}: hops={}", hashHex,
-                        hops == TransportConstant.PATHFINDER_M ? "unknown" : hops);
+                // DEBUG, not INFO: this and the three requestPath lines below fire once per
+                // known peer per 15s cycle — ~100 lines per cycle at 50 known peers, ~24k/h per
+                // aspect. The per-cycle summary above carries the same signal at 1/N the volume.
+                if (log.isDebugEnabled()) {
+                    int hops = Transport.getInstance().hopsTo(dhash);   // ConcurrentHashMap.get() — no lock
+                    log.debug("Path to {}: hops={}", hashHex,
+                            hops == TransportConstant.PATHFINDER_M ? "unknown" : hops);
+                }
                 // Hybrid reconnect strategy:
                 //
                 // createLinkedPeerFromIdentity() creates an outgoing link immediately
@@ -417,11 +428,11 @@ final class RNSAspectRunner {
                     outgoingLinksCreated++;
                 } else {
                     if (recentlyFailed) {
-                        log.info("{}: backing off to requestPath for {} (recent PENDING failure)", aspect, hashHex);
+                        log.debug("{}: backing off to requestPath for {} (recent PENDING failure)", aspect, hashHex);
                     } else if (!outgoingSlotFree) {
-                        log.info("{}: requestPath for {} (outgoing slot in use)", aspect, hashHex);
+                        log.debug("{}: requestPath for {} (outgoing slot in use)", aspect, hashHex);
                     } else {
-                        log.info("{}: requestPath for {} (no cached identity)", aspect, hashHex);
+                        log.debug("{}: requestPath for {} (no cached identity)", aspect, hashHex);
                     }
                     Transport.getInstance().requestPath(dhash);
                 }

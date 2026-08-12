@@ -522,9 +522,12 @@ public class RNS {
             if (activePeerCount < peerLimit) {
                 for (ReticulumPeer p: lps) {
                     if (Arrays.equals(p.getDestinationHash(), destinationHash)) {
-                        log.info("QAnnounceHandler - peer exists - found peer matching destinationHash");
+                        // DEBUG, not INFO: this whole loop runs per received announce, and every
+                        // peer on the mesh announces every ~30s. Only the "added new peer" line
+                        // below is a state change worth an INFO.
+                        log.debug("QAnnounceHandler - peer exists - found peer matching destinationHash");
                         if (nonNull(p.getPeerLink())) {
-                            log.info("peer link: {}, status: {}",
+                            log.debug("peer link: {}, status: {}",
                                     encodeHexString(p.getPeerLink().getLinkId()), p.getPeerLink().getStatus());
                         }
                         peerExists = true;
@@ -545,7 +548,7 @@ public class RNS {
                                 p.setDeleteMe(true);
                             }
                         } else {
-                            log.info("QAnnounceHandler - peer link is null");
+                            log.debug("QAnnounceHandler - peer link is null");
                         }
                     }
                 }
