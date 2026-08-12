@@ -13,7 +13,6 @@ import io.reticulum.link.Link;
 import io.reticulum.transport.AnnounceHandler;
 import static io.reticulum.link.LinkStatus.ACTIVE;
 import static io.reticulum.link.LinkStatus.CLOSED;
-import static io.reticulum.link.LinkStatus.PENDING;
 import static io.reticulum.utils.DestinationUtils.hashFromNameAndIdentity;
 import lombok.Getter;
 import lombok.Synchronized;
@@ -36,7 +35,6 @@ import static java.util.Objects.nonNull;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.function.Function;
-import java.time.Duration;
 import java.time.Instant;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -103,6 +101,10 @@ public class RNS {
     /** Owns the linked (initiator) and incoming (non-initiator) peer lists and their snapshots. */
     private final RNSPeerRegistry registry = new RNSPeerRegistry();
 
+    /** The four prunePeers() passes. Removal side effects stay here, behind the two callbacks. */
+    private final RNSPeerPruner peerPruner = new RNSPeerPruner(
+            registry, this::removeLinkedPeer, this::removeIncomingPeer, this::recordPendingFailure);
+
     // Gateway announce (reticulumAnnounceGateway): advertise-host resolution and dialling of
     // peer-announced gateways live in RNSGatewayManager; the announce payload that carries them
     // (QAN1 container, legacy QGW1 fallback) lives in RNSAnnounceCodec.
@@ -137,14 +139,6 @@ public class RNS {
     // just in case the classic TCP/IP Networking is turned off.
     private static final byte[] MAINNET_MESSAGE_MAGIC = new byte[]{0x51, 0x4f, 0x52, 0x54}; // QORT
     private static final byte[] TESTNET_MESSAGE_MAGIC = new byte[]{0x71, 0x6f, 0x72, 0x54}; // qort
-    /**
-     * How long a Link may go with no inbound activity before we treat it as unreachable. Liveness
-     * now comes from the Reticulum Link's native keepalive via its (library-fixed) lastInbound,
-     * which is refreshed on real traffic AND on keepalive round-trips (every ~360s, the library
-     * KEEPALIVE, when idle). Allow ~2x that so an idle-but-alive link riding on keepalives alone is
-     * not culled. Replaces the old app-level ping + 165s lastAccessTimestamp staleness.
-     */
-    private static final long LINK_INBOUND_TIMEOUT_MS = 2 * 360 * 1000L; // ms (~2x library KEEPALIVE)
     /**
      * How often runBaseLoop() triggers maybeAnnounce() and path recovery, independent
      * of prunePeers(). This ensures announces fire even when the Controller scheduler is
@@ -192,6 +186,12 @@ public class RNS {
             ConcurrentHashMap<String, Long> timeMap) {
         timeMap.put(hashHex, System.currentTimeMillis());
         pendingFailureCount.merge(hashHex, 1, Integer::sum);
+    }
+
+    /** {@link #recordPendingFailure(String, ConcurrentHashMap)} against the aspect's time map. */
+    private void recordPendingFailure(String hashHex, RNSCommon.PeerAspect aspect) {
+        recordPendingFailure(hashHex,
+                aspect == RNSCommon.PeerAspect.DATA ? pendingDataLinkFailureMs : pendingLinkFailureMs);
     }
 
     /**
@@ -1332,152 +1332,20 @@ public class RNS {
         peer.makePeerUnavailable();
     }
 
-    public Boolean isUnreachable(ReticulumPeer peer) {
-        if (peer.getDeleteMe()) {
-            return true;
-        }
-        var link = peer.getPeerLink();
-        if (link == null || link.getStatus() == CLOSED) {
-            // No link, or the library/Channel already tore it down (a wedged Channel that hits
-            // 'retry count exceeded' closes the Link) — definitively unreachable.
-            return true;
-        }
-        // Liveness from the Link's native keepalive via the (now library-fixed) lastInbound,
-        // replacing the app-level Channel ping. If a wedged Channel had killed the link we'd have
-        // caught it via CLOSED above, so link-level liveness is a sufficient proxy here.
-        var lastInbound = link.getLastInbound();
-        if (nonNull(lastInbound) && lastInbound.isBefore(Instant.now().minusMillis(LINK_INBOUND_TIMEOUT_MS))) {
-            log.debug("RNS - link is unreachable (no inbound for > {}ms)", LINK_INBOUND_TIMEOUT_MS);
-            return true;
-        }
-        return false;
+    /** Whether a peer's link is dead, marked for removal, or has gone silent. */
+    public boolean isUnreachable(ReticulumPeer peer) {
+        return RNSPeerPruner.isUnreachable(peer);
     }
 
-    /** Incoming peers whose link is missing or not ACTIVE. */
-    public List<ReticulumPeer> getNonActiveIncomingPeers() {
-        return registry.nonActiveIncoming();
-    }
-
+    /**
+     * Periodic peer-list garbage collection, called from Controller every 90 seconds.
+     * <p>
+     * Keeps {@code throws DataException} because Controller.java wraps the call in a
+     * {@code catch (DataException)} — Java rejects a catch clause for a checked exception the body
+     * cannot throw, so dropping it here would force an unrelated Controller edit.
+     */
     public void prunePeers() throws DataException {
-        // prune initiator peers
-        Link pLink;
-        List<ReticulumPeer> initiatorPeerList = getImmutableLinkedPeers();
-        List<ReticulumPeer> incomingPeerList = getImmutableIncomingPeers();
-        int numActiveIncomingPeers = incomingPeerList.size() - getNonActiveIncomingPeers().size();
-        log.info("number of links (linkedPeers (active) / incomingPeers (active) before pruning: {} ({}), {} ({})",
-                initiatorPeerList.size(), getActiveImmutableLinkedPeers().size(),
-                incomingPeerList.size(), numActiveIncomingPeers);
-        for (ReticulumPeer p : initiatorPeerList) {
-            pLink = p.getPeerLink();
-            if (nonNull(pLink)) {
-                if (p.getPeerTimedOut()) {
-                    // options: keep in case peer reconnects or remove => we'll remove it
-                    p.makePeerUnavailable();
-                    removeLinkedPeer(p);
-                    continue;
-                }
-                if (pLink.getStatus() == ACTIVE) {
-                    // Even ACTIVE links can be zombie: buffer dead (deleteMe=true from
-                    // peerBufferReady read error) or silent (no data received for >165s).
-                    // Without this check, the ACTIVE continue below bypasses deleteMe entirely.
-                    if (isUnreachable(p)) {
-                        log.info("Removing unreachable ACTIVE peer ({}): {}",
-                                p.getDeleteMe() ? "deleteMe" : "data timeout",
-                                encodeHexString(p.getDestinationHash()));
-                        p.makePeerUnavailable();
-                        // Close this exact Link — not p.getPeerLink(), which initPeerLink() may
-                        // already have re-pointed at a fresh Link. An orphaned ACTIVE Link never
-                        // dies on its own: its watchdog sends keepalives, the remote answers,
-                        // lastInbound advances, so the staleTime check never fires and the status
-                        // never reaches CLOSED. Test-17 wadin leaked 16,642 watchdog threads this
-                        // way over 2 days (~340/h, RSS 34.8G) before crashing. Safe to close here
-                        // because the link is ACTIVE, not PENDING — no expirePath() cull cascade.
-                        pLink.setStatus(CLOSED);
-                        removeLinkedPeer(p);
-                    }
-                    continue;
-                }
-                if ((pLink.getStatus() == CLOSED) || (p.getDeleteMe()))  {
-                    p.makePeerUnavailable();
-                    p.setDeleteMe(false);
-                    removeLinkedPeer(p);
-                    continue;
-                }
-                if (pLink.getStatus() == PENDING) {
-                    // Give PENDING links 60s to establish before removing them.
-                    // Removing too early races with QAnnounceHandler (which creates a
-                    // new link and then finds peerTimedOut=true from the old teardown).
-                    // Keeping them forever blocks QAnnounceHandler (peerExists=true,
-                    // status != CLOSED, so the announce is silently ignored).
-                    long pendingSeconds = Duration.between(
-                            p.getCreationTimestamp(), Instant.now()).getSeconds();
-                    if (pendingSeconds > 60) {
-                        log.info("Removing PENDING link stuck for {}s: {}", pendingSeconds, p);
-                        p.makePeerUnavailable();
-                        p.setIsPeerAvailable(false);
-                        // Record failure so the reconnect loop backs off to requestPath() for this
-                        // peer for PENDING_FAILURE_BACKOFF_MS, avoiding the cull cascade.
-                        String phex = encodeHexString(p.getDestinationHash());
-                        if (p.getPeerAspect() == RNSCommon.PeerAspect.DATA) {
-                            recordPendingFailure(phex, pendingDataLinkFailureMs);
-                        } else {
-                            recordPendingFailure(phex, pendingLinkFailureMs);
-                        }
-                        removeLinkedPeer(p);
-                        // Do NOT call pLink.teardown() here.
-                        // teardown() sets status=CLOSED → jobs() finds CLOSED link in pendingLinks
-                        // → calls expirePath() → tablesLastCulled=EPOCH → next jobs() does a full
-                        // routing table cull (60-120s when announce-flooded). Multiple teardowns
-                        // chain into cascading culls that hold the Transport lock for 22+ minutes,
-                        // blocking all outbound() / requestPath() calls during that window.
-                        // We remove the peer from our own tracking only; the library's zombie PENDING
-                        // links have a 774000s (8.9 day) timeout (hopsTo=PATHFINDER_M → no path),
-                        // which is harmless compared to the cull cascade.
-                    }
-                    continue;
-                }
-            }
-        }
-        // prune non-initiator peers
-        List<ReticulumPeer> inaps = getNonActiveIncomingPeers();
-        for (ReticulumPeer p: inaps) {
-            // Don't call pLink.teardown() — synchronized(link) can block the Controller
-            // scheduler if the Reticulum library is processing on this link. The library
-            // handles non-active link cleanup via its own keepalive/watchdog mechanism.
-            removeIncomingPeer(p);
-        }
-        // Dedup ACTIVE incoming peers by remote identity. linkEstablished() resolves the identity
-        // (null at construction time because the handshake wasn't complete yet), so by prune time
-        // (~60s later) it is available. Keep the newest peer per identity; remove the rest.
-        for (Map.Entry<String, List<ReticulumPeer>> entry : registry.activeIncomingDuplicateGroups().entrySet()) {
-            List<ReticulumPeer> dupes = entry.getValue();
-            // Keep the one with the most recent data; remove the rest
-            dupes.sort((a, b) -> b.getLastAccessTimestamp().compareTo(a.getLastAccessTimestamp()));
-            for (int i = 1; i < dupes.size(); i++) {
-                log.info("prunePeers: removing duplicate ACTIVE incoming peer from {}", entry.getKey());
-                removeIncomingPeer(dupes.get(i));
-            }
-        }
-        // Prune ACTIVE incoming peers that have gone silent: the initiator moved to a new
-        // link so pings stopped flowing, but the old library-level link is still ACTIVE.
-        // 165s = 3 missed pings.
-        for (ReticulumPeer p : getImmutableIncomingPeers()) {
-            Link pl = p.getPeerLink();
-            if (nonNull(pl) && pl.getStatus() == ACTIVE && isUnreachable(p)) {
-                log.info("Removing stale ACTIVE incoming peer (data timeout): {}", encodeHexString(p.getDestinationHash()));
-                removeIncomingPeer(p);
-            }
-        }
-        initiatorPeerList = getImmutableLinkedPeers();
-        incomingPeerList = getImmutableIncomingPeers();
-        numActiveIncomingPeers = incomingPeerList.size() - getNonActiveIncomingPeers().size();
-        log.info("number of links (linkedPeers (active) / incomingPeers (active) after pruning: {} ({}), {} ({})",
-                initiatorPeerList.size(), getActiveImmutableLinkedPeers().size(),
-                incomingPeerList.size(), numActiveIncomingPeers);
-        // announce() and requestPath() are intentionally NOT called here — both involve
-        // Reticulum library calls that can block if the library holds a lock. The Controller
-        // thread must not block (node hangs, stop.sh hangs). runBaseLoop() handles both on
-        // its own thread every 30 seconds.
+        peerPruner.prune();
     }
 
     public void maybeAnnounce(Destination d, RNSCommon.PeerAspect pa) {
