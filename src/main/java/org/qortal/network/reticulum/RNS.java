@@ -18,10 +18,6 @@ import org.qortal.settings.Settings;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
-import static java.nio.file.StandardOpenOption.CREATE;
-import static java.nio.file.StandardOpenOption.WRITE;
-import java.nio.file.Files;
-import java.nio.file.Path;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static java.util.Objects.nonNull;
@@ -141,10 +137,6 @@ public class RNS {
             log.info("creating config in {}", defaultConfigPath);
             RNSConfigWriter.ensureConfig(defaultConfigPath, APP_NAME, TARGET_PORT);
             reticulum = new Reticulum(defaultConfigPath);
-            var identitiesPath = reticulum.getStoragePath().resolve("identities");
-            if (Files.notExists(identitiesPath)) {
-                Files.createDirectories(identitiesPath);
-            }
         } catch (IOException e) {
             log.error("unable to create Reticulum network", e);
         }
@@ -169,7 +161,6 @@ public class RNS {
                 (hashHex, aspect) -> policyFor(aspect).recordFailure(hashHex));
     }
 
-    // Note: potentially create persistent serverIdentity (utility rnid) and load it from file
     public void start() {
         // The constructor logs and continues when the Reticulum stack can't be built, so the
         // singleton is published half-built. Dereferencing reticulum here would then NPE inside
@@ -180,23 +171,7 @@ public class RNS {
             return;
         }
 
-        // create identity either from file or new (creating new keys)
-        var serverIdentityPath = reticulum.getStoragePath().resolve("identities/"+APP_NAME);
-        if (Files.isReadable(serverIdentityPath)) {
-            serverIdentity = Identity.fromFile(serverIdentityPath);
-            log.info("server identity loaded from file {}", serverIdentityPath);
-        } else {
-            serverIdentity = new Identity();
-            log.info("APP_NAME: {}, storage path: {}", APP_NAME, serverIdentityPath);
-            log.info("new server identity created dynamically.");
-            // save it back to file by default for next start (possibly add setting to override)
-            try {
-                Files.write(serverIdentityPath, serverIdentity.getPrivateKey(), CREATE, WRITE);
-                log.info("serverIdentity written back to file");
-            } catch (IOException e) {
-                log.error("Error while saving serverIdentity to {}", serverIdentityPath, e);
-            }
-        }
+        serverIdentity = RNSIdentityStore.loadOrCreate(reticulum.getStoragePath(), APP_NAME);
         log.debug("Server Identity: {}", serverIdentity.toString());
 
         // show the ifac_size of the configured interfaces (debug code)
