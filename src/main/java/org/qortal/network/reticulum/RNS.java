@@ -9,12 +9,9 @@ import io.reticulum.destination.Direction;
 import io.reticulum.destination.ProofStrategy;
 import io.reticulum.identity.Identity;
 import io.reticulum.link.Link;
-import io.reticulum.transport.AnnounceHandler;
 import static io.reticulum.link.LinkStatus.ACTIVE;
 import static io.reticulum.link.LinkStatus.CLOSED;
-import static io.reticulum.utils.DestinationUtils.hashFromNameAndIdentity;
 import lombok.Getter;
-import lombok.Synchronized;
 
 import org.qortal.network.Peer;
 import org.qortal.network.message.*;
@@ -94,13 +91,8 @@ public class RNS {
     // (QAN1 container, legacy QGW1 fallback) lives in RNSAnnounceCodec.
     private final RNSGatewayManager gatewayManager;
 
-    /** Announced version keyed by identity hash (hex). Lets incoming peers (which have no announce
-     *  at construction) resolve their version once they identify. Bounded LRU to avoid unbounded
-     *  growth from mesh-wide announces. */
-    private final Map<String, String> announcedVersions = Collections.synchronizedMap(
-            new LinkedHashMap<String, String>(64, 0.75f, true) {
-                @Override protected boolean removeEldestEntry(Map.Entry<String, String> e) { return size() > 512; }
-            });
+    /** Versions learned from announces, so inbound peers can resolve theirs once they identify. */
+    private final AnnouncedVersionCache announcedVersions = new AnnouncedVersionCache();
 
     /** One mesh loop per aspect: drain, announce, reconnect. Both created in start(). */
     private RNSAspectRunner baseRunner;
@@ -227,8 +219,8 @@ public class RNS {
 
         baseDestination.setLinkEstablishedCallback(this::baseClientConnected);
         dataDestination.setLinkEstablishedCallback(this::dataClientConnected);
-        Transport.getInstance().registerAnnounceHandler(new QAnnounceHandler(CORE_ASPECT));
-        Transport.getInstance().registerAnnounceHandler(new QAnnounceHandler(QDN_ASPECT));
+        registerAnnounceHandler(CORE_ASPECT, RNSCommon.PeerAspect.BASE, MIN_DESIRED_CORE_PEERS);
+        registerAnnounceHandler(QDN_ASPECT, RNSCommon.PeerAspect.DATA, MIN_DESIRED_DATA_PEERS);
         log.debug("announceHandlers: {}", Transport.getInstance().getAnnounceHandlers());
         // Load peer hashes persisted from previous run so we can call requestPath() fast on restart.
         this.basePeerStore = new KnownPeerStore(reticulum.getStoragePath(), KNOWN_PEERS_FILE, "BASE");
@@ -266,6 +258,13 @@ public class RNS {
                 registry, policy, gatewayManager, rnsWorkerPool, this::buildAnnounceAppData,
                 (dhash, identity) -> createLinkedPeerFromIdentity(dhash, identity, aspect),
                 this::isShuttingDown, logInterfaceStatus, rnsThreadPriority);
+    }
+
+    /** One announce handler per aspect, registered with Transport for the process lifetime. */
+    private void registerAnnounceHandler(String aspectFilter, RNSCommon.PeerAspect aspect, int minDesiredPeers) {
+        Transport.getInstance().registerAnnounceHandler(new RNSAnnounceHandler(
+                aspectFilter, aspect, minDesiredPeers, registry, gatewayManager,
+                announcedVersions, getMessageMagic(), this::addLinkedPeer));
     }
 
     public boolean isMeshStarted() {
@@ -427,165 +426,6 @@ public class RNS {
         return host;
     }
 
-    /** Record a peer's announced version, keyed by identity hash, for later lookup by incoming peers. */
-    private void cacheAnnouncedVersion(Identity identity, String version) {
-        if (identity == null || identity.getHash() == null || version == null) return;
-        announcedVersions.put(encodeHexString(identity.getHash()), version);
-    }
-
-    /** Announced version for a remote identity, or null if we haven't seen its announce yet. */
-    String getAnnouncedVersion(Identity identity) {
-        if (identity == null || identity.getHash() == null) return null;
-        return announcedVersions.get(encodeHexString(identity.getHash()));
-    }
-
-    private class QAnnounceHandler implements AnnounceHandler {
-        final String aspectFilter;
-
-        QAnnounceHandler(String aspectFilter) {
-            this.aspectFilter = aspectFilter;
-        }
-
-        @Override
-        public String getAspectFilter() {
-            // Return null so Transport fires this handler for ALL received announces.
-            // Transport's hash-based filter (hashFromNameAndIdentity(aspectFilter, recall(hash)))
-            // fails whenever recall() returns null for the incoming announce identity — the
-            // computed hash (no identity component) never matches the actual destination hash,
-            // so receivedAnnounce() is never called. We filter by name inside the handler instead.
-            return null;
-        }
-
-        @Override
-        // Serialises announce processing per handler instance. Note the two instances (BASE, DATA)
-        // hold separate Lombok $locks, so this does NOT serialise the aspects against each other —
-        // it only stops one aspect's announces from interleaving with themselves. Cheap now that
-        // the gateway dial (a TCP connect) runs on RNSGatewayManager's executor rather than here,
-        // on Reticulum's announce-delivery thread.
-        @Synchronized
-        public void receivedAnnounce(byte[] destinationHash,
-                                     Identity announcedIdentity,
-                                     byte[] appData,
-                                     byte[] announcePacketHash,
-                                     boolean isPathResponse) {
-            var peerExists = false;
-            var activePeerCount = 0;
-
-            log.debug("Received an announce from {}", encodeHexString(destinationHash));
-
-            // Since getAspectFilter() returns null (match-all), we must verify manually.
-            // Recompute the expected hash for "qortal.core" + the announced identity and
-            // compare; skip announces that belong to other apps/aspects.
-            var expectedHash = hashFromNameAndIdentity(this.aspectFilter, announcedIdentity);
-            if (!Arrays.equals(destinationHash, expectedHash)) {
-                log.debug("Announce hash mismatch — identity={}, dest={}, expected={}",
-                        announcedIdentity != null ? encodeHexString(announcedIdentity.getHash()) : "null",
-                        encodeHexString(destinationHash),
-                        encodeHexString(expectedHash));
-                return;
-            }
-
-            String announcedVersion = null;
-            if (nonNull(appData)) {
-                RNSAnnounceCodec.AnnounceInfo info = RNSAnnounceCodec.decode(appData);
-                announcedVersion = info.getVersion();
-                // If the announce advertises a Qortal gateway, optionally dial it as a dynamic
-                // backbone client interface.
-                if (info.hasGateway()) {
-                    gatewayManager.maybeAddDynamicGateway(info.getGatewayHost(), info.getGatewayPort());
-                }
-                // Cache the announced version so incoming peers (no announce at construction) can
-                // resolve it once they identify.
-                if (announcedVersion != null) {
-                    cacheAnnouncedVersion(announcedIdentity, announcedVersion);
-                }
-            }
-
-            // Enforce minPeerVersion: skip peers that announce a version below the configured
-            // minimum (unless the operator allows older peers). Unknown/unparseable versions are
-            // NOT skipped — only a known, parseable, below-minimum version is rejected.
-            if (announcedVersion != null && !Settings.getInstance().getAllowConnectionsWithOlderPeerVersions()) {
-                long announced = RNSAnnounceCodec.parseVersionToLong(announcedVersion);
-                long minVersion = RNSAnnounceCodec.parseVersionToLong(Settings.getInstance().getMinPeerVersion());
-                if (announced != 0 && minVersion != 0 && announced < minVersion) {
-                    log.info("Skipping announce from {} — version {} < minPeerVersion {}",
-                            encodeHexString(destinationHash), announcedVersion,
-                            Settings.getInstance().getMinPeerVersion());
-                    return;
-                }
-            }
-
-            // add to peer list if we can use more peers
-            boolean isDataAspect = QDN_ASPECT.equals(this.aspectFilter);
-            int peerLimit = isDataAspect ? MIN_DESIRED_DATA_PEERS : MIN_DESIRED_CORE_PEERS;
-            RNSCommon.PeerAspect matchAspect = isDataAspect ? RNSCommon.PeerAspect.DATA : RNSCommon.PeerAspect.BASE;
-            var lps =  RNS.getInstance().getImmutableLinkedPeers();
-            for (ReticulumPeer p: lps) {
-                var pl = p.getPeerLink();
-                if (nonNull(pl) && pl.getStatus() == ACTIVE && p.getPeerAspect() == matchAspect) {
-                    activePeerCount = activePeerCount + 1;
-                }
-            }
-            if (activePeerCount < peerLimit) {
-                for (ReticulumPeer p: lps) {
-                    if (Arrays.equals(p.getDestinationHash(), destinationHash)) {
-                        // DEBUG, not INFO: this whole loop runs per received announce, and every
-                        // peer on the mesh announces every ~30s. Only the "added new peer" line
-                        // below is a state change worth an INFO.
-                        log.debug("QAnnounceHandler - peer exists - found peer matching destinationHash");
-                        if (nonNull(p.getPeerLink())) {
-                            log.debug("peer link: {}, status: {}",
-                                    encodeHexString(p.getPeerLink().getLinkId()), p.getPeerLink().getStatus());
-                        }
-                        peerExists = true;
-                        if (nonNull(p.getPeerLink()) && (p.getPeerLink().getStatus() == CLOSED)) {
-                            // Only re-initiate for CLOSED links. PENDING links are already
-                            // connecting — creating a second link would race with the first
-                            // and the first's TIMEOUT callback would set peerTimedOut=true,
-                            // poisoning the peer and triggering premature pruning.
-                            p.getOrInitPeerLink();
-                        }
-                        break;
-                    } else {
-                        if (nonNull(p.getPeerLink())) {
-                            log.debug("QAnnounceHandler - other peer - link: {}, status: {}",
-                                    encodeHexString(p.getPeerLink().getLinkId()), p.getPeerLink().getStatus());
-                            if (p.getPeerLink().getStatus() == CLOSED) {
-                                // mark peer for deletion on next pruning
-                                p.setDeleteMe(true);
-                            }
-                        } else {
-                            log.debug("QAnnounceHandler - peer link is null");
-                        }
-                    }
-                }
-                if (!peerExists) {
-                    ReticulumPeer newPeer = getNewPeer(destinationHash, announcedIdentity, announcedVersion);
-                    addLinkedPeer(newPeer);
-                    log.info("added new {} ReticulumPeer, destinationHash: {}, version: {}",
-                            newPeer.getPeerAspect(), encodeHexString(destinationHash), announcedVersion);
-                }
-            }
-        }
-
-        private ReticulumPeer getNewPeer(byte[] destinationHash, Identity announcedIdentity, String announcedVersion) {
-            boolean isDataAspect = QDN_ASPECT.equals(this.aspectFilter);
-            RNSCommon.PeerAspect aspect = isDataAspect ? RNSCommon.PeerAspect.DATA : RNSCommon.PeerAspect.BASE;
-            // Aspect is set by the constructor; setIsDataPeer() is only a setPeerAspect() wrapper.
-            ReticulumPeer newPeer = new ReticulumPeer(destinationHash, aspect);
-            newPeer.setServerIdentity(announcedIdentity);
-            newPeer.setIsInitiator(true);
-            newPeer.setMessageMagic(getMessageMagic());
-            // Version advertised in the announce appData (may be null if not present); surfaced via
-            // /peers/reticulum. Display-only — the numeric min-version gate is unaffected.
-            if (announcedVersion != null) {
-                newPeer.setPeersVersionString(announcedVersion);
-            }
-            log.debug(">>> ReticulumPeer created - PeerData: {} - {}", newPeer.getPeerData().toString(), newPeer.getPeerAddress().getDestinationHash());
-            return newPeer;
-        }
-    }
-
     // Create and add an initiator ReticulumPeer directly from a cached identity (no announce
     // needed). Called from a runner's reconnect pass when recall() finds the identity in the local
     // known-destinations DB.
@@ -741,7 +581,7 @@ public class RNS {
         peer.setServerIdentity(identity);
         // Now that we know the remote identity, attach its announced version (if we've heard its
         // announce) so /peers/reticulum shows the real version for inbound peers too.
-        String version = getAnnouncedVersion(identity);
+        String version = announcedVersions.get(identity);
         if (version != null) {
             peer.setPeersVersionString(version);
         }
