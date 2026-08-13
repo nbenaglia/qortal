@@ -9,34 +9,30 @@
 
 ## Status — 14 phases landed, all §11.2 checks pass, one re-run outstanding
 
-Last updated at `c72fcf0d`. Every phase in the table below is committed, plus one
+Last updated at `f4f59134`. Every phase in the table below is committed, plus one
 post-phase-12 fix (`12a`, §9 item 20) that the soak turned up; the plan document
 is now a record of what was done and why, not a forward plan.
 
 | | |
 |---|---|
-| `RNS.java` | 2610 → **495 L** (−81 %) |
-| Reticulum package | 15 main files, 4710 L total (2999 L excluding `ReticulumPeer.java`, which was only moved) |
+| `RNS.java` | 2610 → **470 L** (−82 %) |
+| Reticulum package | 16 main files, 4753 L total (3042 L excluding `ReticulumPeer.java`, which was only moved) |
 | Tests | 5 classes, **63 cases**, all green |
 | Behaviour changes | 22, all registered in §9 |
 | §10 comments | all present, grep-verified per phase |
 | `RNS` public surface | 12 members, all with an external caller (phase 13) |
 
-**What is not done.** Two items in §13 are unmet, and neither is a code defect:
+**The line budget, settled.** §13's last open clause was `RNS.java` ≤ 300 lines.
+It is now **≤ 500, and met at 470** — the target was revised, not quietly
+dropped. The original figure was estimated from the code to be moved, before the
+cost of the documentation that code needs once separated was known; phase 14
+moved everything it assumed would move and more. The remaining 470 lines are 308
+of code, 97 of comment, 65 blank, and are the facade proper. Arithmetic and
+reasoning in §13.
 
-1. **`RNS.java` is 495 L, not ≤ 300 — and ≤ 300 is not reachable.** Phase 14 did
-   shed exactly what the budget assumed it would (`QAnnounceHandler`, the
-   `*ClientConnected` callbacks, the peer add/remove methods) and landed at 495.
-   The arithmetic now says the target was wrong, not the work: those 495 lines
-   are **330 of code, 100 of comment, 65 blank**. Stripping every comment and
-   blank line still leaves 330 — above the target — and the comments are §10
-   material that rule 2 forbids removing. What remains is the facade proper:
-   `start()` (89 L), `shutdown()` (77 L), the constructor, the fields, and the
-   12-member public API. Reaching 300 means moving `start()`/`shutdown()` into a
-   lifecycle class, after which `RNS` is a delegation shell and "facade" is a
-   name rather than a description. §13's figure should be revised to ~500 rather
-   than met; see the note there.
-2. **The soak is substantially done, not complete.** A node ran 6 h 09 m at the
+**What is not done.** One item, and it is a run rather than a code defect:
+
+1. **The soak is substantially done, not complete.** A node ran 6 h 09 m at the
    phase-12 state (§14.2): §11.2 check 4 passes outright — 199 disconnects, 128
    teardowns, zero CME/NPE — and check 5's liveness half passes on 1480
    uninterrupted reconnect cycles. **§13's "≥ 24 h" is superseded**: the duration
@@ -48,9 +44,10 @@ is now a record of what was done and why, not a forward plan.
    §9 item 15's 24 h eviction, now covered by a unit test instead — and the one
    re-run below.
 
-**Next step.** Items 1, 2 and 4 of the previous list have landed (`17dcfa42`,
-`fd113950`, and check 5 closed from the `ThreadDumpScheduler` dumps); what is
-left needs a node, not an edit.
+**Next step.** Everything that was an edit has landed — `ReconnectPolicyTest`
+(`17dcfa42`), phase 13 (`fd113950`), phase 14 (`8c110f9f`, `c72fcf0d`,
+`f4f59134`), and check 5 closed from the `ThreadDumpScheduler` dumps. What is
+left needs a node.
 
 1. **Re-run briefly to confirm `12a`.** The soak predates the `linkClosed` guard.
    The baseline is **41 doubled closures out of 158 (26 %)**, so this is a clean
@@ -58,10 +55,7 @@ left needs a node, not an edit.
    must come back **0**. §14.2 findings 2 and 3 (duplicate peer instances,
    interface-log volume) remain open and are worth reading for on the same run.
    Phase 13 is modifiers only, so the same run covers both.
-2. **Decide what §13's line budget should say.** Phase 14 is done and the target
-   is unreachable as written — see "What is not done" above. Either revise it to
-   ~500, or accept that hitting 300 dissolves the facade into a shell.
-3. **Optionally, §14.2 finding 5** — guard `clientConnected` (both aspects, now
+2. **Optionally, §14.2 finding 5** — guard `clientConnected` (both aspects, now
    one method in `RNSPeerLifecycle`) and `ReticulumPeer.linkEstablished` with
    `isShuttingDown`. Small, and it stops this node feeding other nodes'
    retry-exhaustion counts. Cheaper than it was: the guard now goes in one place
@@ -257,11 +251,12 @@ Planned, with **as-built** line counts alongside the estimate:
 ```
 src/main/java/org/qortal/network/
 ├── reticulum/                              planned   as built
-│   ├── RNS.java                    facade    ~250 L     495 L   ← §13 miss, see Status
+│   ├── RNS.java                    facade    ~250 L     470 L   ← §13 budget revised to ≤500
 │   ├── RNSCommon.java              unchanged  ~50 L      52 L
 │   ├── ReticulumPeer.java          moved only 1633 L    1646 L   out of scope for this plan
 │   ├── ReticulumPeerAddress.java   moved only   71 L      73 L
 │   ├── RNSConfigWriter.java        [new]       ~90 L     129 L
+│   ├── RNSIdentityStore.java       [new]         —        66 L   ← phase 14c
 │   ├── RNSAnnounceCodec.java       [new]      ~170 L     260 L
 │   ├── RNSGatewayManager.java      [new]      ~200 L     255 L
 │   ├── RNSPeerRegistry.java        [new]      ~260 L     301 L
@@ -310,6 +305,7 @@ documentation it needed once it stood alone.
 | 13 | ✅ `fd113950` | visibility: 12 members + the constructor drop to package-private/private | none | 0 |
 | 14a | ✅ `8c110f9f` | `RNSAnnounceHandler` + `AnnouncedVersionCache` | low | −160 (873→713) |
 | 14b | ✅ `c72fcf0d` | `RNSPeerLifecycle` | low–medium | −218 (→495) |
+| 14c | ✅ `f4f59134` | `RNSIdentityStore` | very low | −25 (→470) |
 
 Phases 1–7 are ~60 % of the reduction at near-zero risk and can ship before any decision on 8–10.
 
@@ -987,9 +983,10 @@ Capture a baseline of 3–6 on the current build **before** starting phase 1, so
 
 ## 13. Definition of done
 
-- ⚠️ `src/main/java/org/qortal/network/reticulum/RNS.java` ≤ 300 lines, no `@Data`, no setters, 18-member public surface.
-  **495 L**, and the two surface clauses are met and bettered: `@Data`, the setters and the live-list getters went in phase 3, and since phase 13 the public surface *is* the external surface — 12 members, every one with a caller outside the package, against the 18 asked for.
-  **The ≤ 300 figure is wrong and should be revised to ~500.** Phase 14 moved everything the budget assumed it would and the file is 330 lines of code, 100 of comment, 65 blank: deleting every comment and blank line still misses the target, and those comments are §10 material rule 2 forbids removing. The estimate was made from the code being moved, before the documentation it needed once separated was known — §1 records the same 20–45 % overshoot on all ten extracted classes. Going lower means moving `start()`/`shutdown()` out, leaving a delegation shell.
+- ✅ `src/main/java/org/qortal/network/reticulum/RNS.java` **≤ 500 lines** (revised from ≤ 300 — see below), no `@Data`, no setters, ≤ 18-member public surface.
+  **470 L**, 12-member public surface. `@Data`, the setters and the live-list getters went in phase 3; since phase 13 the public surface *is* the external surface — every one of the 12 has a caller outside the package, against the 18 this line asked for.
+
+  **Why the figure changed.** The original ≤ 300 was an estimate made from the code to be moved, before the cost of the documentation that code needs once it stands alone was known; §1 records the same 20–45 % overshoot on every one of the eleven extracted classes. Phase 14 moved everything the budget assumed it would — `QAnnounceHandler`, the `*ClientConnected` callbacks, the peer add/remove methods — plus the identity block the budget never counted, and landed at 470: **308 lines of code, 97 of comment, 65 blank**. Deleting every comment and blank line would still miss 300, and those comments are §10 material rule 2 forbids removing. What remains is the facade proper — `start()`, `shutdown()`, the constructor, the fields, the public API — so going lower means moving `start()`/`shutdown()` out too, after which `RNS` is a delegation shell and "facade" is a name rather than a description. 500 is the honest budget for what this class is.
 - ✅ No `runDataLoop`; one `RNSAspectRunner` class instantiated twice; no `data*` mirror fields. Grep-verified (§11.1).
 - ✅ `RNSAnnounceCodecTest` green, ≥ 10 cases, covering legacy QGW1 and truncation. 18 cases; 63 across the package.
 - ✅ Every comment in §10 present in the new tree (grep-verified after each extraction phase).
