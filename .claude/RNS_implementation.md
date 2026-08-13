@@ -41,25 +41,71 @@ reasoning in §13.
    `shutdown of Reticulum complete` and the JVM exited in 10 s. **All six §11.2
    checks now pass**: thread identity, the last one open, is closed on a later
    12 h dump pair (§14.2). What remains is one path duration alone cannot reach —
-   §9 item 15's 24 h eviction, now covered by a unit test instead — and the one
-   re-run below.
+   §9 item 15's 24 h eviction, now covered by a unit test instead — and the
+   re-run in **Next steps** below, whose scope has grown: it is now the only
+   evidence for `12a` *and* phases 13 and 14.
 
-**Next step.** Everything that was an edit has landed — `ReconnectPolicyTest`
-(`17dcfa42`), phase 13 (`fd113950`), phase 14 (`8c110f9f`, `c72fcf0d`,
-`f4f59134`), and check 5 closed from the `ThreadDumpScheduler` dumps. What is
-left needs a node.
+---
 
-1. **Re-run briefly to confirm `12a`.** The soak predates the `linkClosed` guard.
-   The baseline is **41 doubled closures out of 158 (26 %)**, so this is a clean
-   pass/fail rather than a judgement call — the duplicate-group count in §14.2
-   must come back **0**. §14.2 findings 2 and 3 (duplicate peer instances,
-   interface-log volume) remain open and are worth reading for on the same run.
-   Phase 13 is modifiers only, so the same run covers both.
-2. **Optionally, §14.2 finding 5** — guard `clientConnected` (both aspects, now
-   one method in `RNSPeerLifecycle`) and `ReticulumPeer.linkEstablished` with
-   `isShuttingDown`. Small, and it stops this node feeding other nodes'
-   retry-exhaustion counts. Cheaper than it was: the guard now goes in one place
-   rather than two.
+## Next steps
+
+Everything that was an edit has landed and is pushed to
+`nbenaglia/feature/reticulum-refactoring` — `ReconnectPolicyTest` (`17dcfa42`),
+phase 13 (`fd113950`), phase 14 (`8c110f9f`, `c72fcf0d`, `f4f59134`), and §11.2
+check 5 closed from the `ThreadDumpScheduler` dumps. **Everything remaining needs
+a node.**
+
+### 1. One node run, now validating four phases — required
+
+The last soak (§14.2) predates `12a`, phase 13 and phase 14. The re-run was
+originally about one grep; it is now the only evidence for a restructure that
+moved the inbound-accept path, the announce handler, every peer add/remove and
+the identity load. Run it before treating the refactor as finished.
+
+**Pass/fail, in order of what would hurt most if broken:**
+
+| # | What | How | Expect |
+|---|---|---|---|
+| 1 | `12a` teardown dedup | the §14.2 grep below | **0** (baseline: 41 of 158, 26 %) |
+| 2 | Mesh forms at all (14a) | `grep "added new .* ReticulumPeer" qortal.log` | non-zero; BASE and DATA both connect |
+| 3 | Inbound accept, both aspects (14b item 21) | `grep -c "BASE client connected"` / `"DATA client connected"` | both non-zero |
+| 4 | Identity still loads (14c) | `grep "server identity loaded from file"` | present, once, at startup |
+| 5 | Clean shutdown | §11.2 check 6 | `shutdown of Reticulum complete`, JVM exits ≤ ~15 s |
+
+```bash
+grep "Disconnecting peer" qortal.log \
+  | sed -E 's/^(.{19}) .*peer ([^ ]+).*/\1 \2/' | sort | uniq -c | awk '$1>1' | wc -l
+```
+
+**One gap this run will not close.** Check 4 above only proves the *load* branch
+of `RNSIdentityStore`. Phase 14c also moved the `identities/` directory creation
+out of the `RNS` constructor into the store, and that code runs **only on a node
+with no existing identity** — which the soak host is not. To exercise it, start a
+node against an empty storage path once and confirm both lines appear:
+
+```
+new server identity created dynamically.
+serverIdentity written back to file
+```
+
+A regression here is invisible on an existing node and costs a fresh node its
+persistent mesh address, so it is worth the single throwaway start.
+
+### 2. Optional, in the order I would do them
+
+1. **§14.2 finding 5** — guard `RNSPeerLifecycle.clientConnected` with the
+   `shuttingDown` supplier it already holds, and `ReticulumPeer.linkEstablished`
+   the same way. Stops this node accepting links ~7 s after declaring shutdown
+   complete, and stops it feeding other nodes' retry-exhaustion counts. Cheaper
+   since 14b: one guard on the inbound side, not two.
+2. **§14.2 finding 3** — the interface-status block is 4 lines per 15 s, ~20 % of
+   the log, never changing value. Log on transition, with a periodic line only
+   while something is offline.
+3. **§14.2 finding 2** — two `ReticulumPeer` instances for one remote, twice in
+   6 h. Pre-existing, and `isLinkedTracked` is meant to prevent it.
+4. **§14.2 finding 4** — `MessageException: Message checksum incorrect`, 3× in
+   6 h. `ReticulumPeer.java` assumes one `buf.read()` yields exactly one whole
+   `Message`. Pre-existing, non-fatal, and inside the file this plan scopes out.
 
 ---
 
@@ -205,15 +251,19 @@ link reaching CLOSED. `Channel.java:379-387` already guards this with
 `outlet.isClosed()`, but teardown runs after `packetTxOp` returns, so the guard
 narrows the race without closing it.
 
-**Finding 5, detail.** `isShuttingDown` is checked in `markPeerForImmediateRemoval`
-(`RNS.java:653`), `dedupIncomingPeerByIdentity` (`:770`) and `linkClosed`
-(`ReticulumPeer.java:741`), but **not** in `baseClientConnected` (`:371`),
-`dataClientConnected` (`:388`) or `ReticulumPeer.linkEstablished` (`:683`). The
-only defence at shutdown is `setProofStrategy(PROVE_NONE)` (`:306-307`), which
-stops proving but does not stop the destination's link-established callback from
-firing. The outbound half is `new Link()` calls already in flight when
-`runner.shutdown()` stopped the reconnect loop: the loop stops, the pending
-LINKREQUESTs do not.
+**Finding 5, detail.** `isShuttingDown` is checked in `markPeerForImmediateRemoval`,
+`dedupIncomingPeerByIdentity` (both now `RNSPeerLifecycle`) and `linkClosed`
+(`ReticulumPeer`), but **not** in the inbound-accept path or
+`ReticulumPeer.linkEstablished`. The only defence at shutdown is
+`setProofStrategy(PROVE_NONE)` in `RNS.shutdown`, which stops proving but does not
+stop the destination's link-established callback from firing. The outbound half is
+`new Link()` calls already in flight when `runner.shutdown()` stopped the reconnect
+loop: the loop stops, the pending LINKREQUESTs do not.
+
+*(Line numbers dropped: they were `RNS.java` positions at the phase-12 state, and
+phase 14 moved every one of these methods. The inbound-accept path the run
+observed as `dataClientConnected` is now `RNSPeerLifecycle.clientConnected`, one
+method for both aspects — which is also why the fix is cheaper than it was.)*
 
 Not a check-6 failure — shutdown still completed in 10 s and the JVM exited. The
 costs are that the registry is mutated after teardown, ping timers are armed on
@@ -222,9 +272,11 @@ rather than a clean close, so they reach `Channel: Retry count exceeded` instead
 of `INITIATOR_CLOSED`. Given that retry exhaustion already accounts for 124 of 158
 link deaths here, every node doing this feeds that number.
 
-The fix, when wanted: guard both `*ClientConnected` with `isShuttingDown` (tearing
-the offered link down rather than accepting it) and guard `linkEstablished` the
-same way — reusing the flag and the discipline the rest of the class already uses.
+The fix, when wanted: guard `RNSPeerLifecycle.clientConnected` with the
+`shuttingDown` supplier it already holds (tearing the offered link down rather than
+accepting it) and guard `ReticulumPeer.linkEstablished` the same way — reusing the
+flag and the discipline the rest of the code already uses. Since phase 14b this is
+one guard on the inbound side, not two.
 
 Findings 1, 3 and 5 repeat §14.1's lesson: all are invisible in a diff and obvious
 in a log. Finding 1 in particular was *introduced as a fix* in phase 12 and then
@@ -890,22 +942,22 @@ which are unrelated methods of the same name.
 
 These encode operational knowledge that is not re-derivable from the code. Each one moves with its code; none may be summarised away.
 
-| Comment (current line) | New home |
+| Comment (line at `4ec4609a`) | Home as built |
 |---|---|
 | Dedicated single-thread executors / `jobsLock` busy-wait rationale (215–221) | `RNSAspectRunner` field block |
 | `PENDING_FAILURE_BACKOFF_MS` / capped-exponential rationale (148–164) | `ReconnectPolicy` |
 | Hybrid reconnect strategy: `createLinkedPeerFromIdentity` vs `requestPath` (738–756) | `RNSAspectRunner.reconnectTick` |
 | Why the 1-link-per-cycle throttle exists (703–706) | `RNSAspectRunner.reconnectTick` |
 | Why `activeIncomingBaseHashes` is precomputed (708–711) | `RNSPeerRegistry.activeIncomingHashes` |
-| Why `createLinkedPeerFromIdentity` must **not** call `getOrInitPeerLink()` (1698–1703) | wherever that factory lands |
-| Why `removeLinkedPeer` deliberately does **not** close `peerLink` (1948–1951) | `RNS.removeLinkedPeer` |
-| Why `makePeerUnavailable()` runs with no RNS lock held (1954–1961) | `RNS.removeLinkedPeer` |
-| `closeIfActive` ACTIVE-only + ABBA-inversion rationale (2078–2088) | `RNS.closeIfActive` |
+| Why `createLinkedPeerFromIdentity` must **not** call `getOrInitPeerLink()` (1698–1703) | `RNSPeerLifecycle.createLinkedPeerFromIdentity` |
+| Why `removeLinkedPeer` deliberately does **not** close `peerLink` (1948–1951) | `RNSPeerLifecycle.removeLinkedPeer` |
+| Why `makePeerUnavailable()` runs with no RNS lock held (1954–1961) | `RNSPeerLifecycle.removeLinkedPeer` |
+| `closeIfActive` ACTIVE-only + ABBA-inversion rationale (2078–2088) | `RNSPeerLifecycle.closeIfActive` |
 | Why PENDING links must not be torn down (`expirePath` cull cascade) (2254–2262) | `RNSPeerPruner.pruneInitiatorPeers` |
 | Watchdog-thread leak: 16,642 threads / RSS 34.8 G (2215–2222) | `RNSPeerPruner.pruneInitiatorPeers` |
 | Why `announce()`/`requestPath()` are not called from `prunePeers` (2330–2333) | `RNSPeerPruner.prune` |
-| Why `getAspectFilter()` returns null (1565–1569) | `QAnnounceHandler` |
-| `createPeerBuffer` vs `getOrInitPeerBuffer` on the broadcast path (1154–1155) | `baseClientConnected` |
+| Why `getAspectFilter()` returns null (1565–1569) | `RNSAnnounceHandler.getAspectFilter` |
+| `createPeerBuffer` vs `getOrInitPeerBuffer` on the broadcast path (1154–1155) | `RNSPeerLifecycle.clientConnected` |
 | `exitHandler()` timeout / zombie-channel rationale (1093–1095) | `RNS.shutdown` |
 | Config truncation fix: delete before write (542–547) | `RNSConfigWriter` |
 | `LINK_INBOUND_TIMEOUT_MS` ≈ 2× library KEEPALIVE (240–247) | `RNSPeerPruner` |
@@ -917,7 +969,21 @@ git show HEAD --stat
 git diff HEAD~1 -- '*.java' | grep '^-' | grep -E '^\-\s*(//|\*)' | grep -vE '^\-\s*//\s*$'
 ```
 
-Every deleted comment line in that output must be accounted for: either it moved (find it in the `+` side) or it belonged to code deleted in phase 1.
+Every deleted comment line in that output must be accounted for: either it moved (find it in the `+` side) or it belonged to code deleted in phase 1. Javadoc that wraps differently because a method was renamed counts as moved — phase 14b re-wrapped several when `baseClientConnected`/`dataClientConnected` became `clientConnected`.
+
+All sixteen were grep-verified present after phase 14. To re-check the table above in one pass:
+
+```bash
+cd src/main/java/org/qortal/network/reticulum
+grep -rl "would call initPeerLink() a second time"   # createLinkedPeerFromIdentity
+grep -rl "deliberately does NOT close peerLink"      # removeLinkedPeer
+grep -rl "No RNS lock is held here"                  # makePeerUnavailable
+grep -rl "ACTIVE-only is deliberate"                 # closeIfActive
+grep -rl "avoids synchronized(link)"                 # createPeerBuffer
+grep -rl "Return null so Transport fires"            # getAspectFilter
+grep -rl "zombie link's channel holds a lock"        # exitHandler
+grep -rl "16,642"                                    # watchdog-thread leak
+```
 
 ---
 
@@ -944,6 +1010,16 @@ grep -n "java\.util\.concurrent\.\|java\.time\.Duration\|io\.reticulum\.interfac
 # phase 10: no BASE/DATA duplicated field pairs left
 grep -nE "dataAnnounce|dataReconnect|lastDataLoop|pendingDataLink" \
      src/main/java/org/qortal/network/reticulum/RNS.java
+# phase 14: the facade no longer holds the announce handler, the peer lifecycle
+# or the identity load
+grep -nE "class QAnnounceHandler|ClientConnected|closeIfActive|addIncomingPeer|Identity\.fromFile" \
+     src/main/java/org/qortal/network/reticulum/RNS.java
+```
+
+And one that must return exactly `470` until the facade is touched again:
+
+```bash
+wc -l < src/main/java/org/qortal/network/reticulum/RNS.java   # §13 budget: ≤ 500
 ```
 
 ### 11.2 Runtime, after phase 2 and after each of 7/8/10
@@ -951,10 +1027,13 @@ grep -nE "dataAnnounce|dataReconnect|lastDataLoop|pendingDataLink" \
 > **Status.** Run at the phase-11 state (§14.1) and soaked 6 h 09 m at the
 > phase-12 state (§14.2). **All six checks pass.** Check 5's thread-identity half
 > was closed separately, on two `ThreadDumpScheduler` dumps 12 h apart rather than
-> on `jcmd`, which could not attach (§14.2). Nothing since (`12a`, phase 13,
-> `ReconnectPolicyTest`) has been on a node: `12a` changes the teardown path and
-> wants the re-run in Status item 1; phase 13 is modifiers only and rides along
-> on it.
+> on `jcmd`, which could not attach (§14.2).
+>
+> **Nothing since the phase-12 state has been on a node** — that is now `12a`,
+> phase 13 and all of phase 14. `12a` changes the teardown path and phase 14
+> moved the inbound-accept path, the announce handler, the peer add/remove
+> methods and the identity load; phase 13 is modifiers only and rides along. The
+> checklist for that one run is in **Next steps**, near the top.
 
 Compiling does not prove the reflection-based `PeerFactory` registration still works, nor that the mesh forms. Run a node and check:
 
