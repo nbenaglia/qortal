@@ -52,9 +52,17 @@ final class RNSConfigWriter {
         }
         Path configFile = Path.of(dir.getAbsolutePath()).resolve(CONFIG_FILE_NAME);
 
-        if (Files.exists(configFile) && !Settings.getInstance().isReticulumRegenerateConfigOnRestart()) {
-            log.debug("Reticulum config exists, skipping.");
+        // Report which of the three branches was taken, at INFO: this runs once per start, and
+        // "we left your edits alone" is the case an operator most needs to be able to confirm.
+        boolean exists = Files.exists(configFile);
+        if (exists && !Settings.getInstance().isReticulumRegenerateConfigOnRestart()) {
+            log.info("Reticulum config exists at {} — leaving it as-is", configFile);
             return;
+        }
+        if (exists) {
+            log.info("Regenerating Reticulum config at {} (reticulumRegenerateConfigOnRestart is set)", configFile);
+        } else {
+            log.info("Writing new Reticulum config to {}", configFile);
         }
 
         try {

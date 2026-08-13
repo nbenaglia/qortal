@@ -878,6 +878,7 @@ Everything here is deliberate. Anything else that changes behaviour is a regress
 | 13 | `shutdown()` tolerates a mesh that never started | 4 | `start()` can now return early, and Controller calls `shutdown()` unconditionally — without this the guard in §6.4 would just move the NPE | "Reticulum mesh was not started — closing worker threads only" |
 | 14 | Snapshot fields are `volatile` | 3 | written by mutators, read by every consumer thread; the `@Data` getter provided no barrier | none observable |
 | 21 | `baseClientConnected`/`dataClientConnected` collapse into one `clientConnected(link, aspect)`; their two INFO lines per inbound connection become one | 14b | the two were near-identical copies — the shape that hid §14.1 finding 1 — and aspect was already their only difference | one `"BASE client connected — link … (hash …)"` per inbound link, where there were two lines, the first of which logged a raw `byte[]` toString beside its own hex |
+| 23 | Reticulum config logging now states which branch was taken, at INFO | — | the constructor logged `creating config in …` unconditionally, before a call that writes only when the config is missing or `reticulumRegenerateConfigOnRestart` is set; on every ordinary start the library's next line (`Config loaded from …`) contradicted it, and the truthful branch was DEBUG | one of `Reticulum config exists at … — leaving it as-is`, `Writing new Reticulum config to …`, `Regenerating Reticulum config at …` — replacing `creating config in …` |
 | 22 | `removePeer(ReticulumPeer)` deleted | 14b | zero callers in `src/main` or `src/test`; package-private, so phase 1's sweep of zero-caller *public* methods missed it | none |
 | 20 | `linkClosed()` claims its handling once per peer instance | 12a | the library calls the callback once **per timed-out packet**, not per link: `Channel.packetTimeout` → `outlet.timedOut()` → `Link.teardown()`, which has no already-closed guard. 26 % of closures ran the full teardown twice | same-second duplicate `Disconnecting peer … reason: link closed` groups drop from 41-of-158 to zero (§14.2 finding 1) |
 
@@ -1037,7 +1038,10 @@ wc -l < src/main/java/org/qortal/network/reticulum/RNS.java   # §13 budget: ≤
 
 Compiling does not prove the reflection-based `PeerFactory` registration still works, nor that the mesh forms. Run a node and check:
 
-1. `Reticulum config exists, skipping.` / `reticulum instance created` — construction path intact.
+1. `Reticulum config exists at … — leaving it as-is` (or `Writing new Reticulum config to …`
+   on a first start) / `reticulum instance created` — construction path intact. Both are INFO;
+   the old `Reticulum config exists, skipping.` was DEBUG, so this check asked for a line that
+   was invisible at the default level (§9 item 23).
 2. `RNS mesh started, baseDestination: <hash>` — `start()` completed.
 3. `GET /peers/reticulum` returns peers with both `BASE` and `DATA` aspects, initiator and incoming.
 4. Over ≥ 1 h: no `ConcurrentModificationException`, no NPE in `shutdown`, `Removing PENDING link stuck for Ns` appears at a similar rate to the baseline (not more).

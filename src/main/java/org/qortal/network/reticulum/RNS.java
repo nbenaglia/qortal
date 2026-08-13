@@ -134,7 +134,6 @@ public class RNS {
     private RNS () {
         log.info("RNS constructor");
         try {
-            log.info("creating config in {}", defaultConfigPath);
             RNSConfigWriter.ensureConfig(defaultConfigPath, APP_NAME, TARGET_PORT);
             reticulum = new Reticulum(defaultConfigPath);
         } catch (IOException e) {
