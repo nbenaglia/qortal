@@ -33,39 +33,31 @@ is now a record of what was done and why, not a forward plan.
    uninterrupted reconnect cycles. **§13's "≥ 24 h" is superseded**: the duration
    was a proxy for teardown volume, and 199 of them is more concurrency exercise
    than a quiet 24 h would give. Check 6 also passes — `stop.sh` reached
-   `shutdown of Reticulum complete` and the JVM exited in 10 s. What remains is
-   not duration but **one** unrun check (thread identity) and one path duration
-   alone cannot reach — §9 item 15's 24 h eviction, now covered by a unit test
-   instead. See §14.2.
+   `shutdown of Reticulum complete` and the JVM exited in 10 s. **All six §11.2
+   checks now pass**: thread identity, the last one open, is closed on a later
+   12 h dump pair (§14.2). What remains is one path duration alone cannot reach —
+   §9 item 15's 24 h eviction, now covered by a unit test instead — and the one
+   re-run below.
 
-**Next step, in priority order.** Items 2 and 4 of the previous list have landed
-(`17dcfa42`, `fd113950`); what is left needs a node, not an edit.
+**Next step.** Items 1, 2 and 4 of the previous list have landed (`17dcfa42`,
+`fd113950`, and check 5 closed from the `ThreadDumpScheduler` dumps); what is
+left needs a node, not an edit.
 
-1. **Close the last §11.2 check — thread identity (check 5).** Needs no *new* run:
-   `jcmd` could not attach on the soak host (`Operation not permitted`), but
-   `ThreadDumpScheduler` already wrote periodic dumps to
-   `/mnt/qortal/thread-dumps/` covering the whole 6 h. Compare the earliest and
-   latest: `grep -oE '"(rnsMesh-|RNS-)[^"]*"' <dump> | sort | uniq -c`. Identical
-   sets with no numeric suffixes proves the watchdog-cancel path spawned no
-   replacements — thread *identity*, which a count alone misses. **Blocked on
-   access, not on work:** the dumps are on the soak host; that path does not
-   exist on the development machine, so the comparison has to be run where the
-   node ran (or the dumps copied over).
-2. **Re-run briefly to confirm `12a`.** The soak predates the `linkClosed` guard.
+1. **Re-run briefly to confirm `12a`.** The soak predates the `linkClosed` guard.
    The baseline is **41 doubled closures out of 158 (26 %)**, so this is a clean
    pass/fail rather than a judgement call — the duplicate-group count in §14.2
    must come back **0**. §14.2 findings 2 and 3 (duplicate peer instances,
    interface-log volume) remain open and are worth reading for on the same run.
    Phase 13 is modifiers only, so the same run covers both.
-3. **Phase 14 — the ≤ 300 L facade**, only if it is still wanted after 1–2.
+2. **Phase 14 — the ≤ 300 L facade**, only if it is still wanted after 1.
    `QAnnounceHandler` is the obvious extraction (~140 L, self-contained, one
    `Transport` registration); the `*ClientConnected` callbacks and the peer
    add/remove methods are another ~180 L that would belong with the registry —
    and phase 13 has just made all of them package-private, so moving them is now
    a within-package edit with no API consequence. This is optional cosmetics next
-   to items 1–2 — the duplication and concurrency problems the refactor set out to
+   to item 1 — the duplication and concurrency problems the refactor set out to
    fix are already gone.
-4. **Optionally, §14.2 finding 5** — guard `baseClientConnected`,
+3. **Optionally, §14.2 finding 5** — guard `baseClientConnected`,
    `dataClientConnected` and `ReticulumPeer.linkEstablished` with `isShuttingDown`.
    Small, and it stops this node feeding other nodes' retry-exhaustion counts.
 
@@ -108,10 +100,35 @@ in one file.
 | 4 — no CME/NPE | ✅ 0 and 0, across **199 disconnects** and **128 teardowns** |
 | 4 — stuck-PENDING rate | ✅ flat: 1 / 1 / 4 / 2 / 2 / 1 per hour, no climb |
 | 5 — loop liveness | ✅ 5892 interface-status lines = 1480 BASE reconnect cycles × 4 interfaces, spread 504 / 956 / 960 / 960 / 956 / 960 / 600 per hour — no hour short |
-| 5 — thread identity | ⬜ `jcmd` could not attach (`Operation not permitted`); use the dumps `ThreadDumpScheduler` already writes to `/mnt/qortal/thread-dumps/` |
+| 5 — thread identity | ✅ closed on a later 12 h window from `ThreadDumpScheduler`, not on `jcmd` — detail below |
 | 6 — clean shutdown | ✅ `stop.sh` at 19:05:34 → `shutdown of Reticulum complete` same second, `Controller: Shutdown complete!` 19:05:44 — **10 s**, inside the ~15 s target. 13 peers closed via `p.shutdown()`, 11 shutdown-packet confirmations at 30–220 ms RTT, both backbone interfaces disconnected, JVM exited. No NPE/CME, and the `exitHandler` timeout guard (`RNS.java:357-364`) never fired. Caveat in finding 5 |
 | §14.1 finding 1 — aspect-aware kick | ✅ DATA teardown 17:13:32 → path request + proactive connect 17:13:33 → link established 17:13:34 (**2 s**); DATA announces at 17:13:26 and 17:13:37, an **11 s** gap against the 30 s interval |
 | §14.1 finding 2 — teardown dedup | ✅ **126 of 128** teardowns are singletons (was 8 warnings for one peer in one second) |
+
+**Check 5, thread identity — the evidence.** Two `ThreadDumpScheduler` dumps 12 h apart
+(2026-08-13 00:28:04 and 12:28:04 CEST) on one JVM — same process, `Qortal` still
+`Id=12`. This is a later run than the 6 h soak above, but it is the same question,
+answered on a longer window:
+
+| Thread | 00:28 | 12:28 |
+|---|---|---|
+| `rnsMesh-BASE` / `rnsMesh-DATA` | Id 146 / 147 | Id 146 / 147 |
+| `RNS-BASE-Announce-1` / `RNS-BASE-Reconnect-1` | Id 462 / 149 | Id 462 / 149 |
+| `RNS-DATA-Announce-1` / `RNS-DATA-Reconnect-1` | Id 461 / 148 | Id 461 / 148 |
+| `RNS-Worker-1/2/3` | Id 158 / 163 / 180 | Id 158 / 163 / 180 |
+| `rns-scheduler-1…8` (library) | 104,107,108,110,113,119,120,121 | same 8 |
+| `rns-scheduler-watchdog-1/2/3` (library) | Id 105 / 111 / 114 | same 3 |
+
+Identical name sets with no numeric growth, and — stronger than the check asked
+for — **identical thread IDs**: these are the same thread objects 12 h apart, not
+merely the same names. Every aspect executor still ends in `-1`, so neither
+`ThreadPoolExecutor` ever minted a replacement worker; the watchdog-cancel path
+spawned nothing. This is what a count alone could not have shown.
+
+The one population that churns is `RNS-LinkWatchdog`, which is library-owned
+(`io.reticulum.link.Link.watchdogJob`) and runs one per live Link: roughly four
+dozen in each dump, with entirely different IDs. Turnover, not accumulation —
+worth stating against the leak §10 records (16,642 threads, RSS 34.8 G).
 
 The two 956s are not gaps: `LOOP_SLEEP_MS = 50` makes the real reconnect period
 ~15.05 s, so 240 cycles take slightly over an hour and one occasionally lands in
@@ -923,11 +940,12 @@ grep -nE "dataAnnounce|dataReconnect|lastDataLoop|pendingDataLink" \
 ### 11.2 Runtime, after phase 2 and after each of 7/8/10
 
 > **Status.** Run at the phase-11 state (§14.1) and soaked 6 h 09 m at the
-> phase-12 state (§14.2). Checks 1–4 and 6 pass; check 5 is split — loop liveness
-> passes, thread identity is unverified because `jcmd` could not attach. Nothing
-> since (`12a`, phase 13, `ReconnectPolicyTest`) has been on a node: `12a` changes
-> the teardown path and wants the re-run in Status item 2; phase 13 is modifiers
-> only and rides along on it.
+> phase-12 state (§14.2). **All six checks pass.** Check 5's thread-identity half
+> was closed separately, on two `ThreadDumpScheduler` dumps 12 h apart rather than
+> on `jcmd`, which could not attach (§14.2). Nothing since (`12a`, phase 13,
+> `ReconnectPolicyTest`) has been on a node: `12a` changes the teardown path and
+> wants the re-run in Status item 1; phase 13 is modifiers only and rides along
+> on it.
 
 Compiling does not prove the reflection-based `PeerFactory` registration still works, nor that the mesh forms. Run a node and check:
 
@@ -961,7 +979,7 @@ Capture a baseline of 3–6 on the current build **before** starting phase 1, so
 - ✅ No `runDataLoop`; one `RNSAspectRunner` class instantiated twice; no `data*` mirror fields. Grep-verified (§11.1).
 - ✅ `RNSAnnounceCodecTest` green, ≥ 10 cases, covering legacy QGW1 and truncation. 18 cases; 63 across the package.
 - ✅ Every comment in §10 present in the new tree (grep-verified after each extraction phase).
-- ⚠️ A node runs with BASE and DATA peers connected, stable thread count, no CME/NPE, and shuts down cleanly.
+- ✅ A node runs with BASE and DATA peers connected, stable thread count, no CME/NPE, and shuts down cleanly.
   **6 h 09 m at the phase-12 state (§14.2), mostly met.** Both aspects connected throughout — BASE at its target of 5, DATA at 5–7 of a desired 8 (peer supply, not a fault). Zero CME/NPE across 199 disconnects and 128 teardowns, and 1480 uninterrupted loop cycles.
-  The original "≥ 24 h" is **superseded**: duration was standing in for teardown volume, and 199 of them exercises the concurrency surface more than a quiet 24 h would. Shutdown is verified: 10 s from `stop.sh` to JVM exit, 13 peers closed gracefully, no NPE/CME (§14.2 check 6) — though the node accepts new links after declaring shutdown complete (§14.2 finding 5). One clause is still unverified: thread *identity* (`jcmd` could not attach; use the `ThreadDumpScheduler` dumps, which live on the soak host). Separately, §9 item 15's eviction is unreachable below 24 h uptime; `ReconnectPolicyTest` (`17dcfa42`, 13 cases) now covers it, which is the answer a longer run could not give — a soak shows the `removeIf` not crashing, the test shows it evicting the right entries and resetting the failure counter with them. See "Next step" in Status.
+  The original "≥ 24 h" is **superseded**: duration was standing in for teardown volume, and 199 of them exercises the concurrency surface more than a quiet 24 h would. Shutdown is verified: 10 s from `stop.sh` to JVM exit, 13 peers closed gracefully, no NPE/CME (§14.2 check 6) — though the node accepts new links after declaring shutdown complete (§14.2 finding 5). Thread *identity*, the last clause open, is now verified too: two `ThreadDumpScheduler` dumps 12 h apart show every RNS-owned thread with the same name **and the same thread ID**, and no executor past its `-1` suffix (§14.2). Separately, §9 item 15's eviction is unreachable below 24 h uptime; `ReconnectPolicyTest` (`17dcfa42`, 13 cases) now covers it, which is the answer a longer run could not give — a soak shows the `removeIf` not crashing, the test shows it evicting the right entries and resetting the failure counter with them. See "Next step" in Status.
 - ⚠️ §9 is the complete diff in observable behaviour; nothing outside it changed. True by construction and review — 20 registered items — but only a node run can confirm it. The 6 h soak (§14.2) confirmed items 4 and the phase-12 kick directly, and turned up one *unregistered* divergence, now registered as item 20.
