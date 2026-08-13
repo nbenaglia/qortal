@@ -143,7 +143,7 @@ public class RNS {
     }
 
     // Constructor
-    public RNS () {
+    private RNS () {
         log.info("RNS constructor");
         try {
             log.info("creating config in {}", defaultConfigPath);
@@ -368,7 +368,7 @@ public class RNS {
         log.info("shutdown of Reticulum complete");
     }
 
-    public void baseClientConnected(Link link) {
+    void baseClientConnected(Link link) {
         log.info("baseClientConnected - link hash: {}, {}", link.getHash(), encodeHexString(link.getHash()));
         ReticulumPeer newPeer = new ReticulumPeer(link);
         newPeer.setPeerLinkHash(link.getHash());
@@ -385,7 +385,7 @@ public class RNS {
         log.info("***> Base client connected, base link: {}", encodeHexString(link.getLinkId()));
     }
 
-    public void dataClientConnected(Link link) {
+    void dataClientConnected(Link link) {
         log.info("dataClientConnected - link hash: {}, {}", link.getHash(), encodeHexString(link.getHash()));
         ReticulumPeer newPeer = new ReticulumPeer(link);
         newPeer.setPeerLinkHash(link.getHash());
@@ -434,7 +434,7 @@ public class RNS {
     }
 
     /** Announced version for a remote identity, or null if we haven't seen its announce yet. */
-    public String getAnnouncedVersion(Identity identity) {
+    String getAnnouncedVersion(Identity identity) {
         if (identity == null || identity.getHash() == null) return null;
         return announcedVersions.get(encodeHexString(identity.getHash()));
     }
@@ -633,7 +633,7 @@ public class RNS {
         return registry.incoming();
     }
 
-    public List<ReticulumPeer> getActiveImmutableLinkedPeers() {
+    List<ReticulumPeer> getActiveImmutableLinkedPeers() {
         return registry.activeLinked();
     }
 
@@ -668,7 +668,7 @@ public class RNS {
         return true;
     }
 
-    public void addLinkedPeer(ReticulumPeer peer) {
+    void addLinkedPeer(ReticulumPeer peer) {
         // The registry dedups atomically with the add: receivedAnnounce() and the reconnect task
         // can both call this concurrently when a peer drops and reconnects.
         if (!registry.addLinked(peer)) {
@@ -688,7 +688,7 @@ public class RNS {
         // from accumulating in the persisted peer list.
     }
 
-    public void removePeer(ReticulumPeer peer) {
+    void removePeer(ReticulumPeer peer) {
         if (peer.isInitiator) {
             removeLinkedPeer(peer);
         } else {
@@ -696,7 +696,7 @@ public class RNS {
         }
     }
 
-    public void removeLinkedPeer(ReticulumPeer peer) {
+    void removeLinkedPeer(ReticulumPeer peer) {
         peer.shutdownChannel(); // clears channel + nulls peerBuffer; no close() to avoid deadlock
         // NOTE: deliberately does NOT close peerLink. Callers that remove an ACTIVE link must close
         // it themselves, passing the exact Link they decided on (see prunePeers) — closing here
@@ -714,7 +714,7 @@ public class RNS {
         peer.makePeerUnavailable();
     }
 
-    public void addIncomingPeer(ReticulumPeer peer) {
+    void addIncomingPeer(ReticulumPeer peer) {
         // The registry evicts any existing incoming peer from the same node with the same aspect
         // (identity + aspect, so a remote's CORE and DATA peers don't evict each other) and hands
         // the superseded ones back for teardown out here, with no registry lock held.
@@ -736,7 +736,7 @@ public class RNS {
      * work with. Then collapses any older duplicate inbound links from the same remote+aspect,
      * keeping this newly-identified one.
      */
-    public void onIncomingPeerIdentified(ReticulumPeer peer, Identity identity) {
+    void onIncomingPeerIdentified(ReticulumPeer peer, Identity identity) {
         if (identity == null) return;
         peer.setServerIdentity(identity);
         // Now that we know the remote identity, attach its announced version (if we've heard its
@@ -766,7 +766,7 @@ public class RNS {
      * (same discipline as {@link #markPeerForImmediateRemoval}). The prunePeers() pass remains as a
      * backstop.
      */
-    public void dedupIncomingPeerByIdentity(ReticulumPeer keep) {
+    void dedupIncomingPeerByIdentity(ReticulumPeer keep) {
         if (this.isShuttingDown) return;
         if (keep.getServerIdentity() == null) return;
         try {
@@ -800,7 +800,7 @@ public class RNS {
         }
     }
 
-    public void removeIncomingPeer(ReticulumPeer peer) {
+    void removeIncomingPeer(ReticulumPeer peer) {
         peer.shutdownChannel(); // clears channel + nulls peerBuffer; no close() to avoid deadlock
         // A stale-but-still-ACTIVE incoming link is kept alive indefinitely by the remote
         // initiator's keepalives, so its watchdog thread never exits — close it. Incoming peers are
@@ -865,7 +865,7 @@ public class RNS {
         ).collect(Collectors.toList());
     }
 
-    public byte[] getMessageMagic() {
+    byte[] getMessageMagic() {
         return Settings.getInstance().isTestNet() ? TESTNET_MESSAGE_MAGIC : MAINNET_MESSAGE_MAGIC;
     }
 
