@@ -7,26 +7,35 @@
 
 ---
 
-## Status — 13 phases landed, 6 h soak passed, two checks outstanding
+## Status — 14 phases landed, all §11.2 checks pass, one re-run outstanding
 
-Last updated at `fd113950`. Every phase in the table below is committed, plus one
+Last updated at `c72fcf0d`. Every phase in the table below is committed, plus one
 post-phase-12 fix (`12a`, §9 item 20) that the soak turned up; the plan document
 is now a record of what was done and why, not a forward plan.
 
 | | |
 |---|---|
-| `RNS.java` | 2610 → **873 L** (−67 %) |
-| Reticulum package | 12 main files, 4569 L total (2923 L excluding `ReticulumPeer.java`, which was only moved) |
+| `RNS.java` | 2610 → **495 L** (−81 %) |
+| Reticulum package | 15 main files, 4710 L total (2999 L excluding `ReticulumPeer.java`, which was only moved) |
 | Tests | 5 classes, **63 cases**, all green |
-| Behaviour changes | 20, all registered in §9 |
+| Behaviour changes | 22, all registered in §9 |
 | §10 comments | all present, grep-verified per phase |
 | `RNS` public surface | 12 members, all with an external caller (phase 13) |
 
 **What is not done.** Two items in §13 are unmet, and neither is a code defect:
 
-1. **`RNS.java` is 873 L, not ≤ 300.** The line budget assumed the facade would
-   shed `QAnnounceHandler` (~140 L) and the peer add/remove methods; no phase in
-   the table ever did that. See "Next step" below.
+1. **`RNS.java` is 495 L, not ≤ 300 — and ≤ 300 is not reachable.** Phase 14 did
+   shed exactly what the budget assumed it would (`QAnnounceHandler`, the
+   `*ClientConnected` callbacks, the peer add/remove methods) and landed at 495.
+   The arithmetic now says the target was wrong, not the work: those 495 lines
+   are **330 of code, 100 of comment, 65 blank**. Stripping every comment and
+   blank line still leaves 330 — above the target — and the comments are §10
+   material that rule 2 forbids removing. What remains is the facade proper:
+   `start()` (89 L), `shutdown()` (77 L), the constructor, the fields, and the
+   12-member public API. Reaching 300 means moving `start()`/`shutdown()` into a
+   lifecycle class, after which `RNS` is a delegation shell and "facade" is a
+   name rather than a description. §13's figure should be revised to ~500 rather
+   than met; see the note there.
 2. **The soak is substantially done, not complete.** A node ran 6 h 09 m at the
    phase-12 state (§14.2): §11.2 check 4 passes outright — 199 disconnects, 128
    teardowns, zero CME/NPE — and check 5's liveness half passes on 1480
@@ -49,17 +58,14 @@ left needs a node, not an edit.
    must come back **0**. §14.2 findings 2 and 3 (duplicate peer instances,
    interface-log volume) remain open and are worth reading for on the same run.
    Phase 13 is modifiers only, so the same run covers both.
-2. **Phase 14 — the ≤ 300 L facade**, only if it is still wanted after 1.
-   `QAnnounceHandler` is the obvious extraction (~140 L, self-contained, one
-   `Transport` registration); the `*ClientConnected` callbacks and the peer
-   add/remove methods are another ~180 L that would belong with the registry —
-   and phase 13 has just made all of them package-private, so moving them is now
-   a within-package edit with no API consequence. This is optional cosmetics next
-   to item 1 — the duplication and concurrency problems the refactor set out to
-   fix are already gone.
-3. **Optionally, §14.2 finding 5** — guard `baseClientConnected`,
-   `dataClientConnected` and `ReticulumPeer.linkEstablished` with `isShuttingDown`.
-   Small, and it stops this node feeding other nodes' retry-exhaustion counts.
+2. **Decide what §13's line budget should say.** Phase 14 is done and the target
+   is unreachable as written — see "What is not done" above. Either revise it to
+   ~500, or accept that hitting 300 dissolves the facade into a shell.
+3. **Optionally, §14.2 finding 5** — guard `clientConnected` (both aspects, now
+   one method in `RNSPeerLifecycle`) and `ReticulumPeer.linkEstablished` with
+   `isShuttingDown`. Small, and it stops this node feeding other nodes'
+   retry-exhaustion counts. Cheaper than it was: the guard now goes in one place
+   rather than two.
 
 ---
 
@@ -251,7 +257,7 @@ Planned, with **as-built** line counts alongside the estimate:
 ```
 src/main/java/org/qortal/network/
 ├── reticulum/                              planned   as built
-│   ├── RNS.java                    facade    ~250 L     873 L   ← §13 miss, see Status
+│   ├── RNS.java                    facade    ~250 L     495 L   ← §13 miss, see Status
 │   ├── RNSCommon.java              unchanged  ~50 L      52 L
 │   ├── ReticulumPeer.java          moved only 1633 L    1646 L   out of scope for this plan
 │   ├── ReticulumPeerAddress.java   moved only   71 L      73 L
@@ -259,6 +265,9 @@ src/main/java/org/qortal/network/
 │   ├── RNSAnnounceCodec.java       [new]      ~170 L     260 L
 │   ├── RNSGatewayManager.java      [new]      ~200 L     255 L
 │   ├── RNSPeerRegistry.java        [new]      ~260 L     301 L
+│   ├── RNSPeerLifecycle.java       [new]         —       284 L   ← phase 14b
+│   ├── RNSAnnounceHandler.java     [new]         —       190 L   ← phase 14a
+│   ├── AnnouncedVersionCache.java  [new]         —        45 L   ← phase 14a
 │   ├── KnownPeerStore.java         [new]       ~80 L     114 L
 │   ├── ReconnectPolicy.java        [new]       ~90 L      85 L
 │   ├── RNSAspectRunner.java        [new]      ~340 L     489 L
@@ -299,6 +308,8 @@ documentation it needed once it stood alone.
 | 12 | ✅ `f6b5d5d5` | three defects found by the first node run (§14) | low | +14 |
 | 12a | ✅ `e6c655cb` | `linkClosed()` claim guard (§9 item 20, §14.2 finding 1) | low | 0 (in `ReticulumPeer`) |
 | 13 | ✅ `fd113950` | visibility: 12 members + the constructor drop to package-private/private | none | 0 |
+| 14a | ✅ `8c110f9f` | `RNSAnnounceHandler` + `AnnouncedVersionCache` | low | −160 (873→713) |
+| 14b | ✅ `c72fcf0d` | `RNSPeerLifecycle` | low–medium | −218 (→495) |
 
 Phases 1–7 are ~60 % of the reduction at near-zero risk and can ship before any decision on 8–10.
 
@@ -818,6 +829,8 @@ Everything here is deliberate. Anything else that changes behaviour is a regress
 | 12 | Zero-caller public methods removed | 1 | §3.3 | none in-tree; note for any out-of-tree consumer |
 | 13 | `shutdown()` tolerates a mesh that never started | 4 | `start()` can now return early, and Controller calls `shutdown()` unconditionally — without this the guard in §6.4 would just move the NPE | "Reticulum mesh was not started — closing worker threads only" |
 | 14 | Snapshot fields are `volatile` | 3 | written by mutators, read by every consumer thread; the `@Data` getter provided no barrier | none observable |
+| 21 | `baseClientConnected`/`dataClientConnected` collapse into one `clientConnected(link, aspect)`; their two INFO lines per inbound connection become one | 14b | the two were near-identical copies — the shape that hid §14.1 finding 1 — and aspect was already their only difference | one `"BASE client connected — link … (hash …)"` per inbound link, where there were two lines, the first of which logged a raw `byte[]` toString beside its own hex |
+| 22 | `removePeer(ReticulumPeer)` deleted | 14b | zero callers in `src/main` or `src/test`; package-private, so phase 1's sweep of zero-caller *public* methods missed it | none |
 | 20 | `linkClosed()` claims its handling once per peer instance | 12a | the library calls the callback once **per timed-out packet**, not per link: `Channel.packetTimeout` → `outlet.timedOut()` → `Link.teardown()`, which has no already-closed guard. 26 % of closures ran the full teardown twice | same-second duplicate `Disconnecting peer … reason: link closed` groups drop from 41-of-158 to zero (§14.2 finding 1) |
 
 **Runtime verification.** A node was run at the phase-5 state (`9e9d8737`) — mesh forms, peers connect, Reticulum working normally. Phases 6–7 changed startup ordering (the peer stores are built in `start()`, not the constructor) and the gateway-dial threading, so **re-run a node before phase 8** and check: known-peer hashes still load at startup ("Loaded N known BASE peer hashes"), `/peers/reticulum` fills as before, and any dynamic gateway add now logs from the `RNS-GatewayDial` thread.
@@ -975,7 +988,8 @@ Capture a baseline of 3–6 on the current build **before** starting phase 1, so
 ## 13. Definition of done
 
 - ⚠️ `src/main/java/org/qortal/network/reticulum/RNS.java` ≤ 300 lines, no `@Data`, no setters, 18-member public surface.
-  **873 L.** `@Data`, the setters and the live-list getters are gone (phase 3), and since phase 13 the public surface *is* the external surface — 12 members, every one with a caller outside the package, against the 18 this line asked for. The line count is the part still missed: the class holds `QAnnounceHandler`, the two `*ClientConnected` callbacks and the peer add/remove methods, which phase 14 in Status would move.
+  **495 L**, and the two surface clauses are met and bettered: `@Data`, the setters and the live-list getters went in phase 3, and since phase 13 the public surface *is* the external surface — 12 members, every one with a caller outside the package, against the 18 asked for.
+  **The ≤ 300 figure is wrong and should be revised to ~500.** Phase 14 moved everything the budget assumed it would and the file is 330 lines of code, 100 of comment, 65 blank: deleting every comment and blank line still misses the target, and those comments are §10 material rule 2 forbids removing. The estimate was made from the code being moved, before the documentation it needed once separated was known — §1 records the same 20–45 % overshoot on all ten extracted classes. Going lower means moving `start()`/`shutdown()` out, leaving a delegation shell.
 - ✅ No `runDataLoop`; one `RNSAspectRunner` class instantiated twice; no `data*` mirror fields. Grep-verified (§11.1).
 - ✅ `RNSAnnounceCodecTest` green, ≥ 10 cases, covering legacy QGW1 and truncation. 18 cases; 63 across the package.
 - ✅ Every comment in §10 present in the new tree (grep-verified after each extraction phase).
